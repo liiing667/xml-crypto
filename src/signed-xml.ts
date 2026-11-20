@@ -11,6 +11,7 @@ import type {
   ObjectAttributes,
   Reference,
   SignatureAlgorithm,
+  SignatureAlgorithmKeyType,
   SignatureAlgorithmType,
   SignedXmlOptions,
 } from "./types";
@@ -53,6 +54,12 @@ function findSignatureValue(signature: Node): string | undefined {
 // https://www.w3.org/TR/xmldsig-core1/#sec-Transforms
 // https://www.w3.org/TR/xml-exc-c14n/#sec-Use
 const exclusiveC14nNamespace = "http://www.w3.org/2001/10/xml-exc-c14n#";
+
+const sha1DigestAlgorithm = "http://www.w3.org/2000/09/xmldsig#sha1";
+const rsaSha1SignatureAlgorithm = "http://www.w3.org/2000/09/xmldsig#rsa-sha1";
+
+const weakAlgorithmAdvice =
+  "is disabled by default because SHA-1 is weak; call enableWeakAlgorithms() on this SignedXml to accept a document that still uses it";
 
 function isExclusiveC14n(algorithm: string | undefined): boolean {
   return (
@@ -212,23 +219,17 @@ export class SignedXml {
    * To add a new hash algorithm create a new class that implements the {@link HashAlgorithm} interface, and register it here. More info: {@link https://github.com/node-saml/xml-crypto#customizing-algorithms|Customizing Algorithms}
    */
   HashAlgorithms: Record<HashAlgorithmType, new () => HashAlgorithm> = {
-    "http://www.w3.org/2000/09/xmldsig#sha1": hashAlgorithms.Sha1,
     "http://www.w3.org/2001/04/xmlenc#sha256": hashAlgorithms.Sha256,
     "http://www.w3.org/2001/04/xmlenc#sha512": hashAlgorithms.Sha512,
   };
-
-  // TODO: In v7.x we may consider deprecating sha1
 
   /**
    * To add a new signature algorithm create a new class that implements the {@link SignatureAlgorithm} interface, and register it here. More info: {@link https://github.com/node-saml/xml-crypto#customizing-algorithms|Customizing Algorithms}
    */
   SignatureAlgorithms: Record<SignatureAlgorithmType, new () => SignatureAlgorithm> = {
-    "http://www.w3.org/2000/09/xmldsig#rsa-sha1": signatureAlgorithms.RsaSha1,
     "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256": signatureAlgorithms.RsaSha256,
     "http://www.w3.org/2007/05/xmldsig-more#sha256-rsa-MGF1": signatureAlgorithms.RsaSha256Mgf1,
     "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512": signatureAlgorithms.RsaSha512,
-    // Disabled by default due to key confusion concerns.
-    // 'http://www.w3.org/2000/09/xmldsig#hmac-sha1': SignatureAlgorithms.HmacSha1
   };
 
   static defaultNsForPrefix = {
@@ -291,7 +292,21 @@ export class SignedXml {
     this.SignatureAlgorithms = {
       "http://www.w3.org/2000/09/xmldsig#hmac-sha1": signatureAlgorithms.HmacSha1,
     };
+    // HMAC-SHA1 is the only HMAC algorithm this library ships, so a document it verifies is
+    // normally digested with SHA-1 as well.
+    this.HashAlgorithms[sha1DigestAlgorithm] = hashAlgorithms.Sha1;
     this.getKeyInfoContent = SignedXml.noop;
+  }
+
+  /**
+   * Re-enables the SHA-1 based algorithms that are off by default: the `rsa-sha1` signature
+   * algorithm and the SHA-1 digest algorithm. SHA-1 is collision-prone, so a document using it
+   * must be accepted deliberately. Call this only when a peer cannot yet produce SHA-256 or
+   * stronger, and keep everything else about how the peer is trusted unchanged.
+   */
+  enableWeakAlgorithms(): void {
+    this.SignatureAlgorithms[rsaSha1SignatureAlgorithm] = signatureAlgorithms.RsaSha1;
+    this.HashAlgorithms[sha1DigestAlgorithm] = hashAlgorithms.Sha1;
   }
 
   /**
@@ -545,6 +560,15 @@ export class SignedXml {
     if (key == null) {
       throw new Error("KeyInfo or publicCert or privateKey is required to validate signature");
     }
+    try {
+      this.assertKeyMatchesAlgorithm(signer, key);
+    } catch (error) {
+      if (callback) {
+        callback(error instanceof Error ? error : new Error("Unknown error"));
+        return;
+      }
+      throw error;
+    }
 
     // An asynchronous algorithm may answer after another check has replaced `this.references`.
     const loadedReferences = this.references;
@@ -655,15 +679,23 @@ export class SignedXml {
   private calculateSignatureValue(doc: Document, callback?: ErrorFirstCallback<string>) {
     const { signedInfoCanon, signer, privateKey } = this.signingInput(doc);
     if (typeof callback === "function") {
+      try {
+        this.assertKeyMatchesAlgorithm(signer, privateKey);
+      } catch (error) {
+        callback(error instanceof Error ? error : new Error("Unknown error"));
+        return;
+      }
       /* eslint-disable-next-line deprecation/deprecation */
       signer.getSignature(signedInfoCanon, privateKey, callback);
     } else {
+      this.assertKeyMatchesAlgorithm(signer, privateKey);
       this.signatureValue = signer.getSignature(signedInfoCanon, privateKey);
     }
   }
 
   private async calculateSignatureValueAsync(doc: Document) {
     const { signedInfoCanon, signer, privateKey } = this.signingInput(doc);
+    this.assertKeyMatchesAlgorithm(signer, privateKey);
     const signatureValue: unknown =
       typeof signer.getSignatureAsync === "function"
         ? await signer.getSignatureAsync(signedInfoCanon, privateKey)
@@ -684,8 +716,26 @@ export class SignedXml {
     const algo = this.SignatureAlgorithms[name];
     if (algo) {
       return new algo();
-    } else {
-      throw new Error(`signature algorithm '${name}' is not supported`);
+    }
+
+    if (name === rsaSha1SignatureAlgorithm) {
+      throw new Error(`signature algorithm '${name}' ${weakAlgorithmAdvice}`);
+    }
+
+    throw new Error(`signature algorithm '${name}' is not supported`);
+  }
+
+  private assertKeyMatchesAlgorithm(signer: SignatureAlgorithm, key: crypto.KeyLike): void {
+    const expected: SignatureAlgorithmKeyType | undefined = signer.keyType;
+    if (expected == null) {
+      return;
+    }
+
+    const actual = utils.getKeyType(key);
+    if (actual !== expected) {
+      throw new Error(
+        `signature algorithm '${signer.getAlgorithmName()}' requires a ${expected} key, but was given a ${actual} key`,
+      );
     }
   }
 
@@ -704,9 +754,13 @@ export class SignedXml {
     const algo = this.HashAlgorithms[name];
     if (algo) {
       return new algo();
-    } else {
-      throw new Error(`hash algorithm '${name}' is not supported`);
     }
+
+    if (name === sha1DigestAlgorithm) {
+      throw new Error(`hash algorithm '${name}' ${weakAlgorithmAdvice}`);
+    }
+
+    throw new Error(`hash algorithm '${name}' is not supported`);
   }
 
   /**

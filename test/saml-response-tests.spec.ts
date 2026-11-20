@@ -15,6 +15,7 @@ describe("SAML response tests", function () {
     );
     isDomNode.assertIsNodeLike(signature);
     const sig = new SignedXml();
+    sig.enableWeakAlgorithms();
     sig.publicCert = fs.readFileSync("./test/static/feide_public.pem");
     sig.loadSignature(signature);
     const result = sig.checkSignature(xml);
@@ -66,6 +67,7 @@ describe("SAML response tests", function () {
     );
     isDomNode.assertIsNodeLike(signature);
     const sig = new SignedXml();
+    sig.enableWeakAlgorithms();
     sig.publicCert = fs.readFileSync("./test/static/feide_public.pem");
     sig.loadSignature(signature);
     expect(
@@ -88,6 +90,7 @@ describe("SAML response tests", function () {
     );
     isDomNode.assertIsNodeLike(signature);
     const sig = new SignedXml();
+    sig.enableWeakAlgorithms();
     sig.publicCert = fs.readFileSync("./test/static/saml_external_ns.pem");
     sig.loadSignature(signature);
     const result = sig.checkSignature(xml);
@@ -106,6 +109,7 @@ describe("SAML response tests", function () {
     );
     isDomNode.assertIsNodeLike(signature);
     const sig = new SignedXml();
+    sig.enableWeakAlgorithms();
     sig.publicCert = fs.readFileSync("./test/static/feide_public.pem");
     sig.loadSignature(signature);
     expect(function () {
@@ -122,6 +126,7 @@ describe("SAML response tests", function () {
     );
     isDomNode.assertIsNodeLike(signature);
     const sig = new SignedXml();
+    sig.enableWeakAlgorithms();
     sig.publicCert = fs.readFileSync("./test/static/feide_public.pem");
     sig.loadSignature(signature);
     // This doesn't matter, just want to make sure that we don't fail due to unknown algorithm
@@ -157,6 +162,7 @@ describe("SAML response tests", function () {
     isDomNode.assertIsNodeLike(signature);
 
     const sig = new SignedXml();
+    sig.enableWeakAlgorithms();
     sig.publicCert = fs.readFileSync("./test/static/saml_external_ns.pem");
     sig.loadSignature(signature);
     /* eslint-disable-next-line deprecation/deprecation */
@@ -196,6 +202,7 @@ describe("SAML response tests", function () {
       );
       isDomNode.assertIsNodeLike(signature);
       const sig = new SignedXml();
+      sig.enableWeakAlgorithms();
       sig.publicCert = fs.readFileSync("./test/static/feide_public.pem");
 
       sig.loadSignature(signature);

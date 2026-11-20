@@ -16,6 +16,7 @@ describe("Document tests", function () {
 
     isDomNode.assertIsNodeLike(node);
     const sig = new SignedXml();
+    sig.enableWeakAlgorithms();
     sig.publicCert = fs.readFileSync("./test/static/feide_public.pem");
     sig.loadSignature(node);
     const result = sig.checkSignature(xml);
@@ -34,6 +35,7 @@ describe("Document tests", function () {
 
     isDomNode.assertIsNodeLike(node);
     const sig = new SignedXml();
+    sig.enableWeakAlgorithms();
     const feidePublicCert = fs.readFileSync("./test/static/feide_public.pem");
     sig.publicCert = feidePublicCert;
     sig.loadSignature(node);
@@ -49,6 +51,7 @@ describe("Validated node references tests", function () {
     const xml = fs.readFileSync("./test/static/valid_saml.xml", "utf-8");
     const doc = new xmldom.DOMParser().parseFromString(xml);
     const sig = new SignedXml();
+    sig.enableWeakAlgorithms();
     sig.getCertFromKeyInfo = SignedXml.getCertFromKeyInfo;
     sig.loadSignature(sig.findSignatures(doc)[0]);
     const validSignature = sig.checkSignature(xml);
@@ -66,6 +69,7 @@ describe("Validated node references tests", function () {
     const xml = fs.readFileSync("./test/static/invalid_signature - changed content.xml", "utf-8");
     const doc = new xmldom.DOMParser().parseFromString(xml);
     const sig = new SignedXml();
+    sig.enableWeakAlgorithms();
     sig.loadSignature(sig.findSignatures(doc)[0]);
     const validSignature = sig.checkSignature(xml);
     expect(validSignature).to.be.false;
@@ -82,6 +86,7 @@ describe("Validated node references tests", function () {
     const xml = fs.readFileSync("./test/static/valid_saml.xml", "utf-8");
     const doc = new xmldom.DOMParser().parseFromString(xml);
     const sig = new SignedXml();
+    sig.enableWeakAlgorithms();
     sig.getCertFromKeyInfo = SignedXml.getCertFromKeyInfo;
     sig.loadSignature(sig.findSignatures(doc)[0]);
     const validSignature = sig.checkSignature(xml);
@@ -98,6 +103,7 @@ describe("Validated node references tests", function () {
     const xml = fs.readFileSync("./test/static/valid_saml.xml", "utf-8");
     const doc = new xmldom.DOMParser().parseFromString(xml);
     const sig = new SignedXml();
+    sig.enableWeakAlgorithms();
     sig.getCertFromKeyInfo = SignedXml.getCertFromKeyInfo;
     sig.loadSignature(sig.findSignatures(doc)[0]);
     const validSignature = sig.checkSignature(xml);
@@ -117,6 +123,7 @@ describe("Validated node references tests", function () {
     const xml = fs.readFileSync("./test/static/invalid_signature - changed content.xml", "utf-8");
     const doc = new xmldom.DOMParser().parseFromString(xml);
     const sig = new SignedXml();
+    sig.enableWeakAlgorithms();
     sig.loadSignature(sig.findSignatures(doc)[0]);
     const validSignature = sig.checkSignature(xml);
     expect(validSignature).to.be.false;
@@ -138,6 +145,7 @@ describe("Signed reference tests", function () {
     const xml = fs.readFileSync("./test/static/valid_saml.xml", "utf-8");
     const doc = new xmldom.DOMParser().parseFromString(xml);
     const sig = new SignedXml();
+    sig.enableWeakAlgorithms();
     sig.getCertFromKeyInfo = SignedXml.getCertFromKeyInfo;
     sig.loadSignature(sig.findSignatures(doc)[0]);
     expect(sig.checkSignature(xml)).to.be.true;

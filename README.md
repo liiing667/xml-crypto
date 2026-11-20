@@ -189,16 +189,32 @@ The callback form of `computeSignature()` and `checkSignature()` is deprecated, 
 
 ### Hashing Algorithms
 
-- SHA1 digests <http://www.w3.org/2000/09/xmldsig#sha1>
 - SHA256 digests <http://www.w3.org/2001/04/xmlenc#sha256>
 - SHA512 digests <http://www.w3.org/2001/04/xmlenc#sha512>
 
 ### Signature Algorithms
 
-- RSA-SHA1 <http://www.w3.org/2000/09/xmldsig#rsa-sha1>
 - RSA-SHA256 <http://www.w3.org/2001/04/xmldsig-more#rsa-sha256>
 - RSA-SHA256 with MGF1 <http://www.w3.org/2007/05/xmldsig-more#sha256-rsa-MGF1>
 - RSA-SHA512 <http://www.w3.org/2001/04/xmldsig-more#rsa-sha512>
+
+The SHA-1 based algorithms are disabled by default because SHA-1 is collision-prone:
+
+- RSA-SHA1 signature <http://www.w3.org/2000/09/xmldsig#rsa-sha1>
+- SHA1 digest <http://www.w3.org/2000/09/xmldsig#sha1>
+
+To accept a document a peer cannot yet re-issue with SHA-256 or stronger, call
+`enableWeakAlgorithms()` on the `SignedXml` instance before signing or verifying. That re-enables
+both algorithms on that instance only; nothing is enabled globally. The alternatives, in order of
+preference, are:
+
+1. Re-sign the document with RSA-SHA256 (or stronger) and a SHA-256 digest. This removes the
+   weak algorithm and needs no opt-in.
+2. Call `enableWeakAlgorithms()` on the verifier, scoped to the integration that still receives
+   SHA-1 documents, while migrating that peer. Keep every other trust decision unchanged.
+
+A document that uses a disabled algorithm fails closed with an error naming the algorithm and the
+method to call, rather than verifying.
 
 HMAC-SHA1 is also available but it is disabled by default
 
@@ -209,6 +225,16 @@ to enable HMAC-SHA1, call `enableHMAC()` on your instance of `SignedXml`.
 This will enable HMAC and disable digital signature algorithms. Due to key
 confusion issues, it is risky to have both HMAC-based and public key digital
 signature algorithms enabled at same time.
+
+### Key type must match the signature algorithm
+
+A signature algorithm declares the family of key it takes: the RSA algorithms take an asymmetric
+public or private key, while HMAC-SHA1 takes a shared secret. `checkSignature()` and
+`computeSignature()` compare the key they are handed with the algorithm the document names and
+throw when the two do not match. This stops an RSA public key from being presented as the HMAC
+secret (and vice versa), which is the key-confusion attack HMAC's separate enablement already
+narrows. A custom algorithm that does not declare a key type is not checked, so registering one
+keeps working unchanged.
 
 [You are able to extend xml-crypto with custom algorithms.](#customizing-algorithms)
 

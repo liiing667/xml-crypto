@@ -1,6 +1,12 @@
-import { X509Certificate, createPrivateKey } from "crypto";
+import {
+  X509Certificate,
+  createPrivateKey,
+  createPublicKey,
+  type KeyLike,
+  type KeyObject,
+} from "crypto";
 import * as xpath from "xpath";
-import type { NamespacePrefix, PemLabel } from "./types";
+import type { NamespacePrefix, PemLabel, SignatureAlgorithmKeyType } from "./types";
 import * as isDomNode from "@xmldom/is-dom-node";
 import { deprecate } from "util";
 
@@ -717,4 +723,39 @@ export function isDescendantOf(node: Node, parent: Node): boolean {
   }
 
   return false;
+}
+
+/**
+ * Classifies a key as a shared secret or an asymmetric key. An HMAC algorithm takes the first; an
+ * RSA algorithm the second. A value Node cannot read as either is a secret, because that is the
+ * form `createHmac()` accepts.
+ */
+export function getKeyType(key: KeyLike): SignatureAlgorithmKeyType {
+  if (typeof key === "object" && !Buffer.isBuffer(key) && "type" in key) {
+    return key.type === "secret" ? "secret" : "asymmetric";
+  }
+
+  try {
+    createPublicKey(key as KeyObject | string | Buffer);
+    return "asymmetric";
+  } catch {
+    // A bare DER public key needs its format and type named; PEM and KeyObject values already
+    // succeeded above, so only a Buffer reaches this attempt.
+    if (Buffer.isBuffer(key)) {
+      try {
+        createPublicKey({ key, format: "der", type: "spki" });
+        return "asymmetric";
+      } catch {
+        try {
+          // A DER X.509 certificate carries an asymmetric public key too.
+          new X509Certificate(key);
+          return "asymmetric";
+        } catch {
+          // Not an asymmetric key either: treat it as the shared secret createHmac() accepts.
+        }
+      }
+    }
+
+    return "secret";
+  }
 }

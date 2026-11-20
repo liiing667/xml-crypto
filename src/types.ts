@@ -54,6 +54,14 @@ export type SignatureAlgorithmType =
   | string;
 
 /**
+ * The family of key a signature algorithm takes. An HMAC algorithm takes a shared secret, while
+ * an asymmetric algorithm takes a public or private key. Matching the key to the algorithm
+ * prevents key-confusion attacks in which, for example, an RSA public key is presented as the
+ * secret an HMAC verification should use.
+ */
+export type SignatureAlgorithmKeyType = "secret" | "asymmetric";
+
+/**
  * @param cert the certificate as a string or array of strings (@see https://www.w3.org/TR/2008/REC-xmldsig-core-20080610/#sec-X509Data)
  * @param prefix an optional namespace alias to be used for the generated XML
  */
@@ -197,6 +205,11 @@ export interface HashAlgorithm {
 
 /** Extend this to create a new SignatureAlgorithm */
 export interface SignatureAlgorithm {
+  /**
+   * The family of key this algorithm verifies with. An algorithm that leaves it unset declares no
+   * expectation, so `SignedXml` does not check the key it is handed.
+   */
+  keyType?: SignatureAlgorithmKeyType;
   /**
    * Sign the given string using the given key
    */

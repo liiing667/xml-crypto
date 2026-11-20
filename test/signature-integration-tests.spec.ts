@@ -14,6 +14,7 @@ import * as isDomNode from "@xmldom/is-dom-node";
 describe("Signature integration tests", function () {
   function verifySignature(xml, expected, xpath, canonicalizationAlgorithm) {
     const sig = new SignedXml();
+    sig.enableWeakAlgorithms();
     sig.privateKey = fs.readFileSync("./test/static/client.pem");
 
     xpath.map(function (n) {
@@ -84,6 +85,7 @@ describe("Signature integration tests", function () {
       "</Signature>";
 
     const sig = new SignedXml();
+    sig.enableWeakAlgorithms();
     sig.publicCert = fs.readFileSync("./test/static/client_public.pem");
     sig.loadSignature(signature);
     const result = sig.checkSignature(xml);
@@ -131,6 +133,7 @@ describe("Signature integration tests", function () {
     );
     isDomNode.assertIsNodeLike(signature);
     const sig = new SignedXml();
+    sig.enableWeakAlgorithms();
     sig.publicCert = fs.readFileSync("./test/static/signature_with_inclusivenamespaces.pem");
     sig.loadSignature(signature);
     const result = sig.checkSignature(childXml ?? "");
@@ -155,6 +158,7 @@ describe("Signature integration tests", function () {
     );
     isDomNode.assertIsNodeLike(signature);
     const sig = new SignedXml();
+    sig.enableWeakAlgorithms();
     sig.publicCert = fs.readFileSync("./test/static/signature_with_inclusivenamespaces.pem");
     sig.loadSignature(signature);
     const result = sig.checkSignature(childXml ?? "");
@@ -179,6 +183,7 @@ describe("Signature integration tests", function () {
     );
     isDomNode.assertIsNodeLike(signature);
     const sig = new SignedXml();
+    sig.enableWeakAlgorithms();
     sig.publicCert = fs.readFileSync("./test/static/signature_with_inclusivenamespaces.pem");
     sig.loadSignature(signature);
     const result = sig.checkSignature(childXml ?? "");
@@ -191,6 +196,7 @@ describe("Signature integration tests", function () {
     const xml = "<library>" + "<book>" + "<name>Harry Potter</name>" + "</book>" + "</library>";
 
     const sig = new SignedXml();
+    sig.enableWeakAlgorithms();
     sig.addReference({
       xpath: "//*[local-name(.)='book']",
       digestAlgorithm: "http://www.w3.org/2000/09/xmldsig#sha1",
@@ -602,6 +608,7 @@ describe("Signature integration tests", function () {
       privateKey: fs.readFileSync("./test/static/client.pem"),
       publicCert: fs.readFileSync("./test/static/client_public.pem"),
     });
+    sig.enableWeakAlgorithms();
     sig.loadSignature(signature);
     expect(sig.checkSignature(signedXml)).to.be.true;
 
@@ -819,6 +826,7 @@ describe("Signature integration tests", function () {
     const xml = '<root xmlns="urn:A"><p:x xmlns:p="urn:p" Id="_1"><y xmlns=""></y></p:x></root>';
 
     const sig = new SignedXml();
+    sig.enableWeakAlgorithms();
     sig.privateKey = fs.readFileSync("./test/static/client.pem");
     sig.canonicalizationAlgorithm = c14n;
     sig.signatureAlgorithm = "http://www.w3.org/2000/09/xmldsig#rsa-sha1";
@@ -837,6 +845,7 @@ describe("Signature integration tests", function () {
     isDomNode.assertIsNodeLike(signature);
 
     const verify = new SignedXml();
+    verify.enableWeakAlgorithms();
     verify.publicCert = fs.readFileSync("./test/static/client_public.pem");
     verify.loadSignature(signature);
     expect(verify.checkSignature(signed)).to.be.true;

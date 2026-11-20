@@ -8,6 +8,7 @@ describe("Callback invocation", function () {
   function createSigner(privateKey: Buffer): SignedXml {
     const sig = new SignedXml();
     sig.privateKey = privateKey;
+    sig.enableWeakAlgorithms();
     sig.addReference({
       xpath: "//*[local-name(.)='x']",
       digestAlgorithm: "http://www.w3.org/2000/09/xmldsig#sha1",

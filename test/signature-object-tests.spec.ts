@@ -24,6 +24,7 @@ const select1Ns = (expression: string, node: Node, ns?: Record<string, string>) 
 
 const checkSignature = (signedXml: string, signedDoc: Document) => {
   const verifier = new SignedXml({ publicCert });
+  verifier.enableWeakAlgorithms();
   const signatureNode = select1Ns("//ds:Signature", signedDoc);
   isDomNode.assertIsNodeLike(signatureNode);
   verifier.loadSignature(signatureNode);
@@ -64,6 +65,7 @@ describe("ds:Object support in XML signatures", function () {
         },
       ],
     });
+    sig.enableWeakAlgorithms();
 
     sig.addReference({
       xpath: "//*[local-name(.)='x']",
@@ -128,6 +130,7 @@ describe("ds:Object support in XML signatures", function () {
         },
       ],
     });
+    sig.enableWeakAlgorithms();
 
     sig.addReference({
       xpath: "/*",
@@ -155,6 +158,7 @@ describe("ds:Object support in XML signatures", function () {
       signatureAlgorithm: "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
       objects: undefined,
     });
+    sigWithNull.enableWeakAlgorithms();
 
     sigWithNull.addReference({
       xpath: "/*",
@@ -178,6 +182,7 @@ describe("ds:Object support in XML signatures", function () {
       signatureAlgorithm: "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
       objects: [],
     });
+    sigWithEmpty.enableWeakAlgorithms();
 
     sigWithEmpty.addReference({
       xpath: "/*",
@@ -212,6 +217,7 @@ describe("ds:Object support in XML signatures", function () {
         },
       ],
     });
+    sig.enableWeakAlgorithms();
 
     sig.addReference({
       xpath: "//*[local-name(.)='Object' and @Id='object1']",
@@ -280,6 +286,7 @@ describe("Valid signatures with ds:Object elements", function () {
         },
       ],
     });
+    sig.enableWeakAlgorithms();
 
     sig.addReference({
       xpath: "/*",
@@ -317,6 +324,7 @@ describe("Valid signatures with ds:Object elements", function () {
         },
       ],
     });
+    sig.enableWeakAlgorithms();
 
     sig.addReference({
       xpath: "/*",
@@ -369,6 +377,7 @@ describe("Valid signatures with ds:Object elements", function () {
         },
       ],
     });
+    sig.enableWeakAlgorithms();
 
     sig.addReference({
       xpath: "//*[local-name(.)='Data']",
@@ -411,6 +420,7 @@ describe("Should successfuly sign references to ds:KeyInfo elements", function (
       },
       getKeyInfoContent: () => "<dummy></dummy>",
     });
+    sig.enableWeakAlgorithms();
 
     sig.addReference({
       xpath: "//*[local-name(.)='KeyInfo']",
@@ -445,6 +455,7 @@ describe("Should successfuly sign references to ds:KeyInfo elements", function (
       signatureAlgorithm: "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
       getKeyInfoContent: () => "<dummy></dummy>",
     });
+    sig.enableWeakAlgorithms();
 
     sig.addReference({
       xpath: "//*[local-name(.)='KeyInfo']",
@@ -570,6 +581,7 @@ describe("Signature self-reference prevention", function () {
       canonicalizationAlgorithm: "http://www.w3.org/2001/10/xml-exc-c14n#",
       signatureAlgorithm: "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
     });
+    sig.enableWeakAlgorithms();
 
     sig.addReference({
       xpath: ".//*[local-name(.)='Signature']",
@@ -590,6 +602,7 @@ describe("Signature self-reference prevention", function () {
       canonicalizationAlgorithm: "http://www.w3.org/2001/10/xml-exc-c14n#",
       signatureAlgorithm: "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
     });
+    sig.enableWeakAlgorithms();
 
     sig.addReference({
       xpath: ".//*[local-name(.)='SignedInfo']",
@@ -610,6 +623,7 @@ describe("Signature self-reference prevention", function () {
       canonicalizationAlgorithm: "http://www.w3.org/2001/10/xml-exc-c14n#",
       signatureAlgorithm: "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
     });
+    sig.enableWeakAlgorithms();
 
     sig.addReference({
       xpath: ".//*[local-name(.)='SignatureMethod']",

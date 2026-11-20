@@ -11,6 +11,7 @@ describe("KeyInfo tests", function () {
     const sig = new SignedXml();
     sig.privateKey = fs.readFileSync("./test/static/client.pem");
     sig.publicCert = fs.readFileSync("./test/static/client_public.pem");
+    sig.enableWeakAlgorithms();
     sig.canonicalizationAlgorithm = "http://www.w3.org/2001/10/xml-exc-c14n#";
     sig.signatureAlgorithm = "http://www.w3.org/2000/09/xmldsig#rsa-sha1";
     sig.computeSignature(xml);
