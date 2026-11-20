@@ -748,6 +748,63 @@ export class SignedXml {
     throw new Error("No references passed validation");
   }
 
+  // A same-document fragment dereferences to every element carrying the id in an attribute the
+  // verifier is configured to trust. Counting distinct nodes keeps one element that exposes the
+  // same id under two recognized attribute names from looking like a duplicated id, while a
+  // second node fails closed instead of silently validating whichever node the XPath lists first:
+  // https://www.w3.org/TR/xmldsig-core1/#sec-Same-Document
+  private dereferenceId(uri: string, doc: Document, ref: Reference): Node | null {
+    const matches: Node[] = [];
+    let matchedXpath: string | undefined;
+    for (const attr of this.idAttributes) {
+      const elemXpath = `//*[@*[local-name(.)='${attr}']='${uri}']`;
+      const selected = xpath.select(elemXpath, doc);
+      if (!utils.isArrayHasLength(selected)) {
+        continue;
+      }
+      matchedXpath = elemXpath;
+      for (const node of selected) {
+        if (!matches.includes(node)) {
+          matches.push(node);
+        }
+      }
+    }
+
+    if (matches.length > 1) {
+      throw new Error(
+        "Cannot validate a document which contains multiple elements with the " +
+          "same value for the ID / Id / Id attributes, in order to prevent " +
+          "signature wrapping attack.",
+      );
+    }
+
+    if (matches.length === 1) {
+      ref.xpath = matchedXpath;
+      return matches[0];
+    }
+    return null;
+  }
+
+  // Signing already refuses to produce such a reference, but a document loaded for verification
+  // can still carry one. A reference whose data is the Signature or SignedInfo itself only
+  // authenticates that structure, never the payload it envelopes, so reject it explicitly rather
+  // than relying on a digest mismatch to happen to fail the fixed-point construction.
+  private assertNotSignatureSelfReference(node: Node): void {
+    const signature = this.findLoadedSignature(node);
+    if (signature == null) {
+      return;
+    }
+    const signedInfo = utils.findChildren(signature, "SignedInfo")[0];
+    if (
+      node === signature ||
+      (signedInfo != null && (node === signedInfo || utils.isDescendantOf(node, signedInfo)))
+    ) {
+      throw new Error(
+        "Cannot validate a reference to the Signature or SignedInfo element itself, in order to prevent signature wrapping attack.",
+      );
+    }
+  }
+
   private validateReference(ref: Reference, doc: Document): string | undefined {
     const uri = ref.uri?.[0] === "#" ? ref.uri.substring(1) : ref.uri;
     let elem: xpath.SelectSingleReturnType = null;
@@ -764,25 +821,11 @@ export class SignedXml {
       // xpath injection
       throw new Error("Cannot validate a uri with quotes inside it");
     } else {
-      let num_elements_for_id = 0;
-      for (const attr of this.idAttributes) {
-        const tmp_elemXpath = `//*[@*[local-name(.)='${attr}']='${uri}']`;
-        const tmp_elem = xpath.select(tmp_elemXpath, doc);
-        if (utils.isArrayHasLength(tmp_elem)) {
-          num_elements_for_id += tmp_elem.length;
+      elem = this.dereferenceId(uri, doc, ref);
+    }
 
-          if (num_elements_for_id > 1) {
-            throw new Error(
-              "Cannot validate a document which contains multiple elements with the " +
-                "same value for the ID / Id / Id attributes, in order to prevent " +
-                "signature wrapping attack.",
-            );
-          }
-
-          elem = tmp_elem[0];
-          ref.xpath = tmp_elemXpath;
-        }
-      }
+    if (isDomNode.isElementNode(elem)) {
+      this.assertNotSignatureSelfReference(elem);
     }
 
     ref.getValidatedNode = deprecate((xpathSelector?: string) => {
