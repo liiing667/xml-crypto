@@ -741,6 +741,92 @@ describe("Signature integration tests", function () {
     }
   });
 
+  describe("the signature structure being verified", function () {
+    const privateKey = fs.readFileSync("./test/static/client.pem");
+    const publicCert = fs.readFileSync("./test/static/client_public.pem");
+
+    function sign(xml: string, transforms: string[]) {
+      const signer = new SignedXml({
+        privateKey,
+        canonicalizationAlgorithm: exclusiveCanonicalization,
+        signatureAlgorithm: "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+      });
+      signer.addReference({
+        xpath: "/*",
+        transforms,
+        digestAlgorithm: "http://www.w3.org/2001/04/xmlenc#sha256",
+      });
+      signer.computeSignature(xml);
+      return { signedXml: signer.getSignedXml(), signatureXml: signer.getSignatureXml() };
+    }
+
+    function createVerifier(signature: Node | string) {
+      const verifier = new SignedXml({ publicCert });
+      verifier.loadSignature(signature);
+      return verifier;
+    }
+
+    const foreignSignature = (signatureXml: string) =>
+      signatureXml.replace(
+        /<SignatureValue>[^<]*<\/SignatureValue>/,
+        "<SignatureValue>AAAA</SignatureValue>",
+      );
+
+    for (const transforms of envelopedTransformOrders) {
+      const order = transforms[0] === envelopedSignature ? "before" : "after";
+
+      it(`should reject a signature nested inside the one being verified, enveloped-signature ${order} canonicalization`, function () {
+        const { signedXml, signatureXml } = sign("<root><role>user</role></root>", transforms);
+        const tampered = signedXml.replace(
+          "</Signature>",
+          () => `${foreignSignature(signatureXml)}</Signature>`,
+        );
+        expect(tampered, "the nesting must change the document").not.to.equal(signedXml);
+
+        const verifier = createVerifier(signatureXml);
+        expect(() => verifier.checkSignature(tampered)).to.throw(
+          "Cannot validate a document which contains nested Signature elements, in order to prevent signature wrapping attack.",
+        );
+        expect(verifier.getSignedReferences()).to.be.empty;
+        expect(createVerifier(signatureXml).checkSignature(signedXml)).to.be.true;
+      });
+
+      it(`should reject a signature wrapped around the one being verified, enveloped-signature ${order} canonicalization`, function () {
+        const { signedXml, signatureXml } = sign("<root><role>user</role></root>", transforms);
+        const tampered = signedXml.replace(
+          signatureXml,
+          () =>
+            `<Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><Object>${signatureXml}</Object></Signature>`,
+        );
+        expect(tampered, "the wrapping must change the document").not.to.equal(signedXml);
+
+        const verifier = createVerifier(signatureXml);
+        expect(() => verifier.checkSignature(tampered)).to.throw(
+          "Cannot validate a document which contains nested Signature elements, in order to prevent signature wrapping attack.",
+        );
+        expect(verifier.getSignedReferences()).to.be.empty;
+      });
+
+      it(`should reject a repackaged signature when the verified signature is detached, enveloped-signature ${order} canonicalization`, function () {
+        const { signedXml, signatureXml } = sign("<root><role>user</role></root>", transforms);
+        const repackaged = signedXml.replace("<SignedInfo>", "<role>admin</role><SignedInfo>");
+        expect(repackaged, "the repackaging must change the Signature").not.to.equal(signedXml);
+
+        const verifier = createVerifier(signatureXml);
+        expect(() => verifier.checkSignature(repackaged)).to.throw(
+          "Cannot validate a document whose Signature element differs from the signature being verified, in order to prevent signature wrapping attack.",
+        );
+        expect(verifier.getSignedReferences()).to.be.empty;
+      });
+
+      it(`should still verify a detached signature the document carries unchanged, enveloped-signature ${order} canonicalization`, function () {
+        const { signedXml, signatureXml } = sign("<root><role>user</role></root>", transforms);
+
+        expect(createVerifier(signatureXml).checkSignature(signedXml)).to.be.true;
+      });
+    }
+  });
+
   for (const transforms of envelopedTransformOrders) {
     for (const location of ["/root", "/root/container"]) {
       describe(`when appending a parent signature to ${location}, enveloped-signature ${transforms[0] === envelopedSignature ? "before" : "after"} canonicalization`, function () {

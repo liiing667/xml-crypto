@@ -65,6 +65,36 @@ function decodeSignatureValue(signature: Node): Buffer {
   return Buffer.from(findSignatureValue(signature) ?? "", "base64");
 }
 
+function isSignatureElement(node: Node): boolean {
+  return (
+    isDomNode.isElementNode(node) &&
+    node.localName === "Signature" &&
+    node.namespaceURI === "http://www.w3.org/2000/09/xmldsig#"
+  );
+}
+
+function hasSignatureAncestor(node: Node): boolean {
+  let current = node.parentNode;
+  while (current != null) {
+    if (isSignatureElement(current)) {
+      return true;
+    }
+    current = current.parentNode;
+  }
+  return false;
+}
+
+// SignatureValue is base64Binary, so spellings that decode to the same bytes are the same
+// signature; every other part of the structure must be identical.
+function serializeSignatureForComparison(signature: Node): string {
+  const clone = signature.cloneNode(true);
+  const signatureValue = utils.findChildren(clone, "SignatureValue")[0];
+  if (signatureValue != null) {
+    signatureValue.textContent = decodeSignatureValue(clone).toString("base64");
+  }
+  return clone.toString();
+}
+
 const warnReferenceUriWithoutFragment = deprecate(
   () => {},
   'Resolving a `Reference` whose `URI` is neither empty nor starts with "#" as a same-document ID is deprecated, and such a signature will not verify in version 7.0. A same-document `URI` is empty, or "#" followed by an ID.',
@@ -473,6 +503,8 @@ export class SignedXml {
 
     // Reset the references as only references from our re-parsed signedInfo node can be trusted
     this.references = [];
+
+    this.assertVerifiableSignatureStructure(doc);
 
     const unverifiedSignedInfoCanon = this.getCanonSignedInfoXml(doc);
     if (!unverifiedSignedInfoCanon) {
@@ -1719,6 +1751,37 @@ export class SignedXml {
       );
     }
     return matches[0] ?? null;
+  }
+
+  // checkSignature() re-parses the document, so the Signature it carries is bound to the loaded
+  // one by structure, not by SignatureValue alone: a lookalike could smuggle content past every
+  // digest that removes it, and a nested Signature past the digest of its ancestor.
+  private assertVerifiableSignatureStructure(doc: Document): void {
+    for (const signature of findSignatureElements(doc)) {
+      if (hasSignatureAncestor(signature)) {
+        throw new Error(
+          "Cannot validate a document which contains nested Signature elements, in order to prevent signature wrapping attack.",
+        );
+      }
+    }
+
+    if (this.signatureNode == null) {
+      return;
+    }
+    const loadedSignature = isDomNode.isDocumentNode(this.signatureNode)
+      ? this.signatureNode.documentElement
+      : this.signatureNode;
+    const signatureInDoc = this.findLoadedSignature(doc);
+    if (
+      loadedSignature != null &&
+      signatureInDoc != null &&
+      serializeSignatureForComparison(loadedSignature) !==
+        serializeSignatureForComparison(signatureInDoc)
+    ) {
+      throw new Error(
+        "Cannot validate a document whose Signature element differs from the signature being verified, in order to prevent signature wrapping attack.",
+      );
+    }
   }
 
   private parseTransformInput(

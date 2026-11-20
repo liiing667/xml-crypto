@@ -94,6 +94,9 @@ The `enveloped-signature` transform removes only the `Signature` element being v
 
 - `checkSignature()` finds that element by its `SignatureValue`, and throws when the document
   contains more than one `Signature` element with that value.
+- `checkSignature()` also throws when a `Signature` element is nested inside another, or when the
+  document's `Signature` element differs from the loaded signature in anything but the spelling of
+  its `SignatureValue`.
 - `getCanonXml()` finds the loaded signature in the node's document the same way, and removes nothing
   when the signature is not there.
 
