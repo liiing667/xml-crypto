@@ -611,12 +611,16 @@ export class SignedXml {
     };
   }
 
-  private getCanonReferenceXml(doc: Document, ref: Reference, node: Node) {
-    /**
-     * Search for ancestor namespaces before canonicalization.
-     */
+  private getCanonReferenceXml(ref: Reference, node: Node) {
     if (Array.isArray(ref.transforms)) {
-      ref.ancestorNamespaces = utils.findAncestorNs(doc, ref.xpath, this.namespaceResolver);
+      // The dereferenced node carries its own ancestor context in the verified document.
+      // Re-running the reference XPath would re-resolve through a caller-supplied
+      // namespaceResolver and could select a different node, so the digest would be
+      // computed over namespaces other than those of the node actually dereferenced:
+      // https://www.w3.org/TR/xmldsig-core1/#sec-ReferenceProcessingModel
+      ref.ancestorNamespaces = isDomNode.isElementNode(node)
+        ? utils.findAncestorNsForElement(node)
+        : [];
     }
 
     const c14nOptions = {
@@ -736,7 +740,7 @@ export class SignedXml {
         }
       }
 
-      const canonXml = this.getCanonReferenceXml(doc, ref, elem);
+      const canonXml = this.getCanonReferenceXml(ref, elem);
       const hash = this.findHashAlgorithm(ref.digestAlgorithm);
       const digest = hash.getHash(canonXml);
 
@@ -764,24 +768,34 @@ export class SignedXml {
       // xpath injection
       throw new Error("Cannot validate a uri with quotes inside it");
     } else {
-      let num_elements_for_id = 0;
+      const elementsForId = new Set<Node>();
+      let resolvedXpath = "";
       for (const attr of this.idAttributes) {
         const tmp_elemXpath = `//*[@*[local-name(.)='${attr}']='${uri}']`;
         const tmp_elem = xpath.select(tmp_elemXpath, doc);
         if (utils.isArrayHasLength(tmp_elem)) {
-          num_elements_for_id += tmp_elem.length;
-
-          if (num_elements_for_id > 1) {
-            throw new Error(
-              "Cannot validate a document which contains multiple elements with the " +
-                "same value for the ID / Id / Id attributes, in order to prevent " +
-                "signature wrapping attack.",
-            );
+          for (const candidate of tmp_elem) {
+            if (isDomNode.isNodeLike(candidate)) {
+              elementsForId.add(candidate);
+              if (resolvedXpath === "") {
+                resolvedXpath = tmp_elemXpath;
+              }
+            }
           }
-
-          elem = tmp_elem[0];
-          ref.xpath = tmp_elemXpath;
         }
+      }
+
+      if (elementsForId.size > 1) {
+        throw new Error(
+          "Cannot validate a document which contains multiple elements with the " +
+            "same value for the ID / Id / Id attributes, in order to prevent " +
+            "signature wrapping attack.",
+        );
+      }
+
+      if (elementsForId.size === 1) {
+        elem = Array.from(elementsForId)[0];
+        ref.xpath = resolvedXpath;
       }
     }
 
@@ -802,7 +816,7 @@ export class SignedXml {
       return undefined;
     }
 
-    const canonXml = this.getCanonReferenceXml(doc, ref, elem);
+    const canonXml = this.getCanonReferenceXml(ref, elem);
     const hash = this.findHashAlgorithm(ref.digestAlgorithm);
     const digest = hash.getHash(canonXml);
 
