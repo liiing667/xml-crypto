@@ -29,6 +29,14 @@ import * as utils from "./utils";
 
 type SigningReferenceTarget = { node: Element; digestValue?: string };
 type UnsignedSignature = { doc: Document; insertSignatureValue: () => void };
+type PendingValidation = {
+  signer: SignatureAlgorithm;
+  key: crypto.KeyLike;
+  signatureValue: string;
+  unverifiedSignedInfoCanon: string;
+  accept: () => void;
+};
+type PrefixListLookup = { get(ref: Reference): string[][] | undefined };
 type C14nOptionsWithXmlAttributes = CanonicalizationOrTransformationAlgorithmProcessOptions & {
   ancestorXmlAttributes?: utils.InheritedXmlAttribute[];
 };
@@ -380,11 +388,11 @@ export class SignedXml {
     if (!pending) {
       return pending;
     }
-    const { signer, key, unverifiedSignedInfoCanon, accept } = pending;
+    const { signer, key, signatureValue, unverifiedSignedInfoCanon, accept } = pending;
 
     if (!callback) {
-      if (signer.verifySignature(unverifiedSignedInfoCanon, key, this.signatureValue) !== true) {
-        throw this.invalidSignature();
+      if (signer.verifySignature(unverifiedSignedInfoCanon, key, signatureValue) !== true) {
+        throw this.invalidSignature(signatureValue);
       }
       accept();
       return true;
@@ -399,7 +407,7 @@ export class SignedXml {
       if (error) {
         callback(error);
       } else if (isValid !== true) {
-        callback(this.invalidSignature());
+        callback(this.invalidSignature(signatureValue));
       } else {
         accept();
         callback(null, true);
@@ -409,7 +417,7 @@ export class SignedXml {
     const returned: unknown = signer.verifySignature(
       unverifiedSignedInfoCanon,
       key,
-      this.signatureValue,
+      signatureValue,
       answer,
     );
     // An algorithm that verifies synchronously can ignore the callback and return its verdict.
@@ -434,22 +442,22 @@ export class SignedXml {
     if (!pending) {
       return false;
     }
-    const { signer, key, unverifiedSignedInfoCanon, accept } = pending;
+    const { signer, key, signatureValue, unverifiedSignedInfoCanon, accept } = pending;
 
     const isValid =
       typeof signer.verifySignatureAsync === "function"
-        ? await signer.verifySignatureAsync(unverifiedSignedInfoCanon, key, this.signatureValue)
-        : signer.verifySignature(unverifiedSignedInfoCanon, key, this.signatureValue);
+        ? await signer.verifySignatureAsync(unverifiedSignedInfoCanon, key, signatureValue)
+        : signer.verifySignature(unverifiedSignedInfoCanon, key, signatureValue);
     if (isValid !== true) {
-      throw this.invalidSignature();
+      throw this.invalidSignature(signatureValue);
     }
     accept();
     return true;
   }
 
-  private invalidSignature(): Error {
+  private invalidSignature(signatureValue = this.signatureValue): Error {
     // TODO: add this breaking change here later on for even more security: `this.references = [];`
-    return new Error(`invalid signature: the signature value ${this.signatureValue} is incorrect`);
+    return new Error(`invalid signature: the signature value ${signatureValue} is incorrect`);
   }
 
   // Core validation up to the signature over `SignedInfo`, which is left to the caller because the
@@ -458,13 +466,14 @@ export class SignedXml {
   private validateReferences(
     xml: string,
     callback?: (error: Error | null, isValid?: boolean) => void,
-  ) {
+  ): PendingValidation | false | undefined {
     // Nothing this check has not authenticated may be visible, even if it throws partway. Success
     // adds to what earlier successful checks on this instance published.
     const earlierSignedReferences = this.signedReferences;
     this.signedReferences = [];
 
     this.signedXml = xml;
+    const signatureValue = this.signatureValue;
 
     const doc = new xmldom.DOMParser().parseFromString(xml);
     if (doc.doctype != null) {
@@ -513,13 +522,14 @@ export class SignedXml {
     // TODO: In a future release we'd like to load the Signature and its References at the same time,
     // however, in the `.loadSignature()` method we don't have the entire document,
     // which we need to to keep the inclusive namespaces
+    const loadedPrefixLists = new Map<Reference, string[][]>();
     for (const reference of references) {
-      this.loadReference(reference);
+      this.loadReference(reference, loadedPrefixLists);
     }
 
     const canonReferences: string[] = [];
     for (const ref of this.references) {
-      const canonXml = this.validateReference(ref, doc);
+      const canonXml = this.validateReference(ref, doc, loadedPrefixLists);
       if (canonXml === undefined) {
         // TODO: add this breaking change here later on for even more security: `this.references = [];`
 
@@ -555,7 +565,7 @@ export class SignedXml {
       });
     };
 
-    return { signer, key, unverifiedSignedInfoCanon, accept };
+    return { signer, key, signatureValue, unverifiedSignedInfoCanon, accept };
   }
 
   private getCanonSignedInfoXml(doc: Document) {
@@ -611,16 +621,23 @@ export class SignedXml {
     };
   }
 
-  private getCanonReferenceXml(doc: Document, ref: Reference, node: Node) {
+  private getCanonReferenceXml(
+    doc: Document,
+    ref: Reference,
+    node: Node,
+    prefixLists: PrefixListLookup = this.loadedPrefixLists,
+  ) {
     /**
      * Search for ancestor namespaces before canonicalization.
      */
+    let ancestorNamespaces = ref.ancestorNamespaces;
     if (Array.isArray(ref.transforms)) {
-      ref.ancestorNamespaces = utils.findAncestorNs(doc, ref.xpath, this.namespaceResolver);
+      ancestorNamespaces = utils.findAncestorNs(doc, ref.xpath, this.namespaceResolver);
+      ref.ancestorNamespaces = ancestorNamespaces;
     }
 
     const c14nOptions = {
-      ancestorNamespaces: ref.ancestorNamespaces,
+      ancestorNamespaces,
       ancestorXmlAttributes: utils.findAncestorXmlAttributes(node),
     };
 
@@ -629,7 +646,7 @@ export class SignedXml {
     const discardComments = ref.uri === "" || ref.uri.startsWith("#");
     return this.canonicalize(ref.transforms, node, c14nOptions, {
       discardComments,
-      prefixLists: this.loadedPrefixLists.get(ref) ?? this.getSigningPrefixLists(ref),
+      prefixLists: prefixLists.get(ref) ?? this.getSigningPrefixLists(ref),
     });
   }
 
@@ -748,7 +765,11 @@ export class SignedXml {
     throw new Error("No references passed validation");
   }
 
-  private validateReference(ref: Reference, doc: Document): string | undefined {
+  private validateReference(
+    ref: Reference,
+    doc: Document,
+    prefixLists?: PrefixListLookup,
+  ): string | undefined {
     const uri = ref.uri?.[0] === "#" ? ref.uri.substring(1) : ref.uri;
     let elem: xpath.SelectSingleReturnType = null;
 
@@ -802,7 +823,7 @@ export class SignedXml {
       return undefined;
     }
 
-    const canonXml = this.getCanonReferenceXml(doc, ref, elem);
+    const canonXml = this.getCanonReferenceXml(doc, ref, elem, prefixLists);
     const hash = this.findHashAlgorithm(ref.digestAlgorithm);
     const digest = hash.getHash(canonXml);
 
@@ -915,7 +936,7 @@ export class SignedXml {
    * Load the reference xml node to a model
    *
    */
-  private loadReference(refNode: Node) {
+  private loadReference(refNode: Node, loadedPrefixLists?: Map<Reference, string[][]>) {
     let nodes = utils.findChildren(refNode, "DigestMethod");
     if (nodes.length === 0) {
       throw new Error(`could not find DigestMethod in reference ${refNode.toString()}`);
@@ -1012,7 +1033,9 @@ export class SignedXml {
       inclusiveNamespacesPrefixList,
       isEmptyUri: false,
     });
-    this.loadedPrefixLists.set(this.references[this.references.length - 1], prefixLists);
+    const reference = this.references[this.references.length - 1];
+    this.loadedPrefixLists.set(reference, prefixLists);
+    loadedPrefixLists?.set(reference, prefixLists);
   }
 
   /**
@@ -1623,10 +1646,13 @@ export class SignedXml {
       prefixLists,
     }: { discardComments: boolean; prefixLists?: ReadonlyArray<string[]> },
   ) {
-    options.defaultNsForPrefix = options.defaultNsForPrefix ?? SignedXml.defaultNsForPrefix;
-    options.ancestorXmlAttributes =
-      options.ancestorXmlAttributes ?? utils.findAncestorXmlAttributes(node);
-    options.signatureNode = this.signatureNode;
+    let transformOptions: C14nOptionsWithXmlAttributes = {
+      ...options,
+      defaultNsForPrefix: options.defaultNsForPrefix ?? SignedXml.defaultNsForPrefix,
+      ancestorXmlAttributes:
+        options.ancestorXmlAttributes ?? utils.findAncestorXmlAttributes(node),
+      signatureNode: this.signatureNode,
+    };
 
     const canonXml = node.cloneNode(true); // Deep clone
     const preserveDocument = isDomNode.isDocumentNode(node);
@@ -1640,7 +1666,7 @@ export class SignedXml {
         signatureAncestor = signatureAncestor.parentNode;
       }
       if (signatureAncestor === node) {
-        options.signatureNode = signaturePath
+        transformOptions.signatureNode = signaturePath
           .reverse()
           .reduce((clonedNode, index) => clonedNode.childNodes[index], canonXml);
       }
@@ -1651,7 +1677,6 @@ export class SignedXml {
       comments.forEach((comment) => comment.parentNode?.removeChild(comment));
     }
     let transformedXml: Node | string = canonXml;
-    let transformOptions = options;
     let parsedFromOctets = false;
 
     // Octets are parsed into a node-set for the next transform, and a node-set left at the end is
@@ -1661,11 +1686,11 @@ export class SignedXml {
         transformedXml = this.parseTransformInput(transformedXml, transformName, preserveDocument);
         // The parsed octets are a new document, so the referenced node's ancestors are gone.
         transformOptions = {
-          ...options,
+          ...transformOptions,
           ancestorNamespaces: [],
           ancestorXmlAttributes: [],
           defaultNs: "",
-          signatureNode: this.findLoadedSignature(transformedXml) ?? options.signatureNode,
+          signatureNode: this.findLoadedSignature(transformedXml) ?? transformOptions.signatureNode,
         };
         parsedFromOctets = true;
       }

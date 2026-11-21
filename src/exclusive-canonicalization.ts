@@ -317,11 +317,9 @@ export class ExclusiveCanonicalization implements CanonicalizationOrTransformati
     options: CanonicalizationOrTransformationAlgorithmProcessOptions,
   ): string {
     options = options || {};
-    const elem = isDomNode.isDocumentNode(node) ? node.documentElement : node;
     let inclusiveNamespacesPrefixList = options.inclusiveNamespacesPrefixList || [];
     const defaultNs = options.defaultNs || "";
     const defaultNsForPrefix = options.defaultNsForPrefix || {};
-    const ancestorNamespaces = options.ancestorNamespaces || [];
 
     /**
      * If the inclusiveNamespacesPrefixList has not been explicitly provided then look it up in CanonicalizationMethod/InclusiveNamespaces
@@ -342,36 +340,77 @@ export class ExclusiveCanonicalization implements CanonicalizationOrTransformati
       }
     }
 
+    // Snapshot the caller's prefix context: it belongs to this document, not to canonicalization.
+    inclusiveNamespacesPrefixList = inclusiveNamespacesPrefixList.slice();
+    const ancestorNamespaces = (options.ancestorNamespaces || []).map((namespace) => ({
+      prefix: namespace.prefix,
+      namespaceURI: namespace.namespaceURI,
+    }));
+
     /**
      * If you have a PrefixList then use it and the ancestors to add the necessary namespaces
      */
-    if (utils.isArrayHasLength(inclusiveNamespacesPrefixList)) {
-      inclusiveNamespacesPrefixList.forEach(function (prefix) {
-        if (ancestorNamespaces) {
-          ancestorNamespaces.forEach(function (ancestorNamespace) {
-            if (prefix === "#default" && ancestorNamespace.prefix === "") {
-              if (!elem.hasAttribute("xmlns")) {
-                elem.setAttributeNS(
-                  "http://www.w3.org/2000/xmlns/",
-                  "xmlns",
-                  ancestorNamespace.namespaceURI,
-                );
-              }
-            } else if (prefix === ancestorNamespace.prefix) {
-              elem.setAttributeNS(
-                "http://www.w3.org/2000/xmlns/",
-                `xmlns:${prefix}`,
-                ancestorNamespace.namespaceURI,
-              );
-            }
-          });
+    const declarationsToRender = new Map<string, string>();
+    const elem = isDomNode.isDocumentNode(node) ? node.documentElement : node;
+    if (utils.isArrayHasLength(inclusiveNamespacesPrefixList) && elem != null) {
+      for (const prefix of inclusiveNamespacesPrefixList) {
+        if (declarationsToRender.has(prefix)) {
+          continue;
         }
-      });
+
+        const declaredOnElement =
+          prefix === "#default"
+            ? elem.hasAttribute("xmlns")
+            : elem.hasAttribute(`xmlns:${prefix}`);
+        if (declaredOnElement) {
+          continue;
+        }
+
+        const ancestorNamespace = ancestorNamespaces.find((namespace) =>
+          prefix === "#default" ? namespace.prefix === "" : namespace.prefix === prefix,
+        );
+        if (ancestorNamespace != null) {
+          declarationsToRender.set(prefix, ancestorNamespace.namespaceURI);
+        }
+      }
+    }
+
+    let canonicalNode: Element | Document = node;
+    if (declarationsToRender.size > 0) {
+      const clone = node.cloneNode(true);
+      if (isDomNode.isDocumentNode(clone)) {
+        canonicalNode = clone;
+      } else if (isDomNode.isElementNode(clone)) {
+        canonicalNode = clone;
+      } else {
+        throw new Error(`Unable to exclusive canonicalize node type: ${clone.nodeType}`);
+      }
+
+      const canonicalElem = isDomNode.isDocumentNode(canonicalNode)
+        ? canonicalNode.documentElement
+        : canonicalNode;
+      if (canonicalElem == null) {
+        throw new Error(`Unable to exclusive canonicalize node type: ${node.nodeType}`);
+      }
+
+      for (const [prefix, namespaceURI] of declarationsToRender) {
+        canonicalElem.setAttributeNS(
+          "http://www.w3.org/2000/xmlns/",
+          prefix === "#default" ? "xmlns" : `xmlns:${prefix}`,
+          namespaceURI,
+        );
+      }
     }
 
     return utils.insideProcess(this, ExclusiveCanonicalization.prototype, () =>
       /* eslint-disable-next-line deprecation/deprecation */
-      this.processInner(node, [], defaultNs, defaultNsForPrefix, inclusiveNamespacesPrefixList),
+      this.processInner(
+        canonicalNode,
+        [],
+        defaultNs,
+        defaultNsForPrefix,
+        inclusiveNamespacesPrefixList,
+      ),
     );
   }
 
