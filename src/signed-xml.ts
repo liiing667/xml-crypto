@@ -174,6 +174,14 @@ export class SignedXml {
   private originalXmlWithIds = "";
   private keyInfo: Node | null = null;
 
+  // Every loaded signature and every checked document starts a generation. State a check
+  // publishes belongs to its own generation, so a later load or check cannot leave reference
+  // data or digest caches describing a document that is no longer the one under inspection.
+  private generation = 0;
+  // The root node the current generation was frozen from, captured at load/check time.
+  private generationRoot: Node | null = null;
+  private referenceGeneration = new WeakMap<Reference, number>();
+
   /**
    * Contains the references that were signed.
    * @see {@link Reference}
@@ -459,11 +467,6 @@ export class SignedXml {
     xml: string,
     callback?: (error: Error | null, isValid?: boolean) => void,
   ) {
-    // Nothing this check has not authenticated may be visible, even if it throws partway. Success
-    // adds to what earlier successful checks on this instance published.
-    const earlierSignedReferences = this.signedReferences;
-    this.signedReferences = [];
-
     this.signedXml = xml;
 
     const doc = new xmldom.DOMParser().parseFromString(xml);
@@ -471,6 +474,11 @@ export class SignedXml {
       warnDocumentTypeDeclaration();
     }
 
+    // A checked document is a fresh generation even when the caller reused `loadSignature()`:
+    // its root and references are frozen here, so reference data and digest caches can never
+    // describe a document this check did not parse.
+    const root = doc.documentElement ?? doc;
+    const generation = this.beginGeneration(root);
     // Reset the references as only references from our re-parsed signedInfo node can be trusted
     this.references = [];
 
@@ -516,6 +524,7 @@ export class SignedXml {
     for (const reference of references) {
       this.loadReference(reference);
     }
+    this.tagReferences(generation);
 
     const canonReferences: string[] = [];
     for (const ref of this.references) {
@@ -546,12 +555,19 @@ export class SignedXml {
       throw new Error("KeyInfo or publicCert or privateKey is required to validate signature");
     }
 
-    // An asynchronous algorithm may answer after another check has replaced `this.references`.
+    // An asynchronous algorithm may answer after another load or check has started a new
+    // generation. Publish only while this check still owns the instance, so a late answer can
+    // never stamp a stale digest cache onto the references of another document.
     const loadedReferences = this.references;
     const accept = () => {
-      this.signedReferences = [...earlierSignedReferences, ...canonReferences];
+      if (this.generation !== generation || !this.isFrozenRoot(root)) {
+        return;
+      }
+      this.signedReferences = canonReferences;
       loadedReferences.forEach((ref, index) => {
-        ref.signedReference = canonReferences[index];
+        if (this.isCurrentGeneration(ref)) {
+          ref.signedReference = canonReferences[index];
+        }
       });
     };
 
@@ -612,6 +628,13 @@ export class SignedXml {
   }
 
   private getCanonReferenceXml(doc: Document, ref: Reference, node: Node) {
+    if (!this.isCurrentGeneration(ref)) {
+      throw new Error(
+        "Cannot canonicalize a reference from a previous document generation; load the " +
+          "signature and check the document again",
+      );
+    }
+
     /**
      * Search for ancestor namespaces before canonicalization.
      */
@@ -827,6 +850,30 @@ export class SignedXml {
     return isDomNode.isArrayOfNodes(nodes) ? nodes : [];
   }
 
+  // Freeze the identity of the document this state belongs to. All references and authenticated
+  // digest data are tagged with this generation, and anything tagged for an older one is stale,
+  // so reloading a signature or checking another document can never publish its predecessor's data.
+  private beginGeneration(root: Node): number {
+    this.generation += 1;
+    this.generationRoot = root;
+    this.signedReferences = [];
+    return this.generation;
+  }
+
+  private isCurrentGeneration(reference: Reference): boolean {
+    return this.referenceGeneration.get(reference) === this.generation;
+  }
+
+  private isFrozenRoot(root: Node): boolean {
+    return this.generationRoot === root;
+  }
+
+  private tagReferences(generation: number): void {
+    for (const reference of this.references) {
+      this.referenceGeneration.set(reference, generation);
+    }
+  }
+
   /**
    * Loads the signature information from the provided XML node or string.
    *
@@ -834,10 +881,11 @@ export class SignedXml {
    */
   loadSignature(signatureNode: Node | string): void {
     if (typeof signatureNode === "string") {
-      this.signatureNode = signatureNode = new xmldom.DOMParser().parseFromString(signatureNode);
-    } else {
-      this.signatureNode = signatureNode;
+      signatureNode = new xmldom.DOMParser().parseFromString(signatureNode);
     }
+    const generation = this.beginGeneration(signatureNode);
+    this.signatureNode = signatureNode;
+    this.references = [];
 
     this.signatureXml = signatureNode.toString();
 
@@ -896,7 +944,6 @@ export class SignedXml {
     );
     const signedInfoDoc = temporaryCanonSignedInfoXml.documentElement;
 
-    this.references = [];
     const references = utils.findChildren(signedInfoDoc, "Reference");
 
     if (!utils.isArrayHasLength(references)) {
@@ -906,6 +953,7 @@ export class SignedXml {
     for (const reference of references) {
       this.loadReference(reference);
     }
+    this.tagReferences(generation);
 
     this.signatureValue = findSignatureValue(signatureNode) ?? "";
     this.keyInfo = utils.findChildren(signatureNode, "KeyInfo")[0] ?? null;
@@ -1316,6 +1364,11 @@ export class SignedXml {
     if (!isDomNode.isElementNode(referenceNode)) {
       warnLocationReferenceNotElement();
     }
+
+    // All validation that can reject the input has passed. Commit the signing generation only
+    // now, so a signing failure leaves a previously loaded verification generation untouched.
+    const generation = this.beginGeneration(doc.documentElement ?? doc);
+    this.tagReferences(generation);
 
     const previousSignatureNode = this.signatureNode;
     this.signatureNode = signatureElem;
