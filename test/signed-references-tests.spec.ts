@@ -1,6 +1,6 @@
 import * as xpath from "xpath";
 import * as xmldom from "@xmldom/xmldom";
-import { SignedXml, type SignedXmlOptions } from "../src/index";
+import { SignedXml, type SignatureAlgorithm, type SignedXmlOptions } from "../src/index";
 import * as fs from "fs";
 import { expect } from "chai";
 import * as isDomNode from "@xmldom/is-dom-node";
@@ -107,5 +107,115 @@ describe("Signed references", function () {
 
     expect(() => sig.checkSignature(unsupported)).to.throw(/is not supported/);
     expect(sig.getSignedReferences()).to.be.empty;
+  });
+
+  it("do not accumulate across two successful checks of different documents on a reused instance", function () {
+    const first = sign();
+    const sig = loadSignature(new SignedXml({ publicCert }), first);
+    expect(sig.checkSignature(first)).to.be.true;
+    expect(sig.getSignedReferences()).to.have.lengthOf(2);
+
+    // The second document carries one reference instead of two, so any leftover would be visible.
+    const secondSigner = new SignedXml({
+      privateKey: fs.readFileSync("./test/static/client.pem"),
+      canonicalizationAlgorithm: exclusiveC14n,
+      signatureAlgorithm: rsaSha256,
+    });
+    secondSigner.addReference({
+      xpath: "//*[local-name(.)='assertion']",
+      transforms: [exclusiveC14n],
+      digestAlgorithm: "http://www.w3.org/2001/04/xmlenc#sha256",
+    });
+    secondSigner.computeSignature(
+      "<response><assertion>other</assertion><extensions/></response>",
+    );
+    const second = secondSigner.getSignedXml();
+
+    loadSignature(sig, second);
+    expect(sig.checkSignature(second)).to.be.true;
+
+    expect(sig.getSignedReferences()).to.deep.equal(["<assertion>other</assertion>"]);
+    /* eslint-disable-next-line deprecation/deprecation */
+    expect(sig.getReferences().map((ref) => ref.signedReference)).to.deep.equal([
+      "<assertion>other</assertion>",
+    ]);
+  });
+
+  it("do not survive a failed reference check, then a retry that succeeds", function () {
+    const xml = sign();
+    const sig = loadSignature(new SignedXml({ publicCert }), xml);
+    expect(sig.checkSignature(xml)).to.be.true;
+    const originallySigned = sig.getSignedReferences();
+    expect(originallySigned).to.have.lengthOf(2);
+
+    // Tamper with the second signed element: its digest no longer matches.
+    const tampered = xml.replace("<extensions/>", "<extensions>tampered</extensions>");
+    loadSignature(sig, tampered);
+    expect(sig.checkSignature(tampered)).to.be.false;
+    expect(sig.getSignedReferences()).to.be.empty;
+
+    // Retrying the intact document must publish exactly its own references, none from before.
+    loadSignature(sig, xml);
+    expect(sig.checkSignature(xml)).to.be.true;
+    expect(sig.getSignedReferences()).to.deep.equal(originallySigned);
+  });
+
+  it("do not mix when checkSignatureAsync() on one document resolves after another check started", async function () {
+    const remoteRsaSha256 = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+    let releaseFirst: (() => void) | undefined;
+    class DelayedRemote implements SignatureAlgorithm {
+      getAlgorithmName() {
+        return remoteRsaSha256;
+      }
+
+      getSignature(): never {
+        throw new Error("this algorithm verifies only asynchronously");
+      }
+
+      verifySignature(): never {
+        throw new Error("this algorithm verifies only asynchronously");
+      }
+
+      async verifySignatureAsync() {
+        await new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+        return true;
+      }
+    }
+
+    const first = sign();
+    const sig = loadSignature(new SignedXml({ publicCert }), first);
+    sig.SignatureAlgorithms[remoteRsaSha256] = DelayedRemote;
+
+    const firstVerdict = sig.checkSignatureAsync(first);
+    expect(sig.getSignedReferences()).to.be.empty;
+
+    // A second, fully synchronous check replaces the state while the first is still pending.
+    const secondSigner = new SignedXml({
+      privateKey: fs.readFileSync("./test/static/client.pem"),
+      canonicalizationAlgorithm: exclusiveC14n,
+      signatureAlgorithm: rsaSha256,
+    });
+    secondSigner.addReference({
+      xpath: "//*[local-name(.)='assertion']",
+      transforms: [exclusiveC14n],
+      digestAlgorithm: "http://www.w3.org/2001/04/xmlenc#sha256",
+    });
+    secondSigner.computeSignature(
+      "<response><assertion>other</assertion><extensions/></response>",
+    );
+    const second = secondSigner.getSignedXml();
+
+    loadSignature(sig, second);
+    expect(sig.checkSignature(second)).to.be.true;
+    expect(sig.getSignedReferences()).to.deep.equal(["<assertion>other</assertion>"]);
+
+    expect(releaseFirst).to.be.a("function");
+    releaseFirst?.();
+    expect(await firstVerdict).to.be.true;
+
+    // The late answer from the first document must not have replaced the second document's state.
+    expect(sig.getSignedReferences()).to.deep.equal(["<assertion>other</assertion>"]);
   });
 });

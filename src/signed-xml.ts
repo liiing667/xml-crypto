@@ -191,6 +191,13 @@ export class SignedXml {
   private signedReferences: string[] = [];
 
   /**
+   * Identifies the most recent `checkSignature()` run. A check whose verdict arrives after another
+   * check started must not publish its references, or it would mix two documents' authenticated
+   * state on the reused instance.
+   */
+  private verificationGeneration = 0;
+
+  /**
    *  To add a new transformation algorithm create a new class that implements the {@link TransformationAlgorithm} interface, and register it here. More info: {@link https://github.com/node-saml/xml-crypto#customizing-algorithms|Customizing Algorithms}
    */
   CanonicalizationAlgorithms: Record<
@@ -459,9 +466,10 @@ export class SignedXml {
     xml: string,
     callback?: (error: Error | null, isValid?: boolean) => void,
   ) {
-    // Nothing this check has not authenticated may be visible, even if it throws partway. Success
-    // adds to what earlier successful checks on this instance published.
-    const earlierSignedReferences = this.signedReferences;
+    // Nothing this check has not authenticated may be visible, even if it throws partway. Each
+    // check publishes only its own references: a failure, a retry, or a later check must never
+    // leave an earlier document's authenticated XML mixed with this one.
+    const generation = ++this.verificationGeneration;
     this.signedReferences = [];
 
     this.signedXml = xml;
@@ -549,13 +557,21 @@ export class SignedXml {
     // An asynchronous algorithm may answer after another check has replaced `this.references`.
     const loadedReferences = this.references;
     const accept = () => {
-      this.signedReferences = [...earlierSignedReferences, ...canonReferences];
-      loadedReferences.forEach((ref, index) => {
-        ref.signedReference = canonReferences[index];
-      });
+      // An earlier check that is still waiting on its algorithm is superseded; whatever it
+      // authenticates belongs to a document this instance no longer represents.
+      if (generation === this.verificationGeneration) {
+        this.publishSignedReferences(loadedReferences, canonReferences);
+      }
     };
 
     return { signer, key, unverifiedSignedInfoCanon, accept };
+  }
+
+  private publishSignedReferences(loadedReferences: Reference[], canonReferences: string[]) {
+    this.signedReferences = canonReferences;
+    loadedReferences.forEach((ref, index) => {
+      ref.signedReference = canonReferences[index];
+    });
   }
 
   private getCanonSignedInfoXml(doc: Document) {

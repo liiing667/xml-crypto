@@ -460,7 +460,7 @@ To verify xml documents:
 Create a new `SignedXml` for each signature you create or verify, including each signature in a document that has more than one. An instance keeps state between calls:
 
 - `computeSignature()` signs every reference the instance holds. `addReference()` adds one, so calling it for each signature on a reused instance adds one more `Reference` to every new signature. `checkSignature()` replaces them with the references of the signature it checks.
-- `getSignedReferences()` returns the references of each successful `checkSignature()` call since the last failed one, which empties it. On a reused instance, that can include content that earlier signatures cover.
+- `getSignedReferences()` returns the references of the most recent `checkSignature()` call only. Any check that does not fully authenticate its document empties it, including a failed reference or signature value, so references authenticated for one document can never be mixed with another's. A check whose asynchronous verdict arrives after another check has started never publishes either.
 
 ## Customizing Algorithms
 
