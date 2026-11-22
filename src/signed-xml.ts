@@ -190,6 +190,10 @@ export class SignedXml {
    */
   private signedReferences: string[] = [];
 
+  // Bumped at the start of every check. An asynchronous algorithm may answer after a retry has
+  // loaded a different signature onto this instance, so only the current generation may publish.
+  private validationGeneration = 0;
+
   /**
    *  To add a new transformation algorithm create a new class that implements the {@link TransformationAlgorithm} interface, and register it here. More info: {@link https://github.com/node-saml/xml-crypto#customizing-algorithms|Customizing Algorithms}
    */
@@ -459,6 +463,12 @@ export class SignedXml {
     xml: string,
     callback?: (error: Error | null, isValid?: boolean) => void,
   ) {
+    // A retry loads a new signature, its KeyInfo and algorithms onto this instance and starts a
+    // new generation. A verdict that arrives later belongs to the earlier identity and must not
+    // publish into state the retry now owns: KeyInfo, algorithms and the verifying key have to
+    // stay one identity.
+    const generation = ++this.validationGeneration;
+
     // Nothing this check has not authenticated may be visible, even if it throws partway. Success
     // adds to what earlier successful checks on this instance published.
     const earlierSignedReferences = this.signedReferences;
@@ -549,6 +559,9 @@ export class SignedXml {
     // An asynchronous algorithm may answer after another check has replaced `this.references`.
     const loadedReferences = this.references;
     const accept = () => {
+      if (generation !== this.validationGeneration) {
+        return;
+      }
       this.signedReferences = [...earlierSignedReferences, ...canonReferences];
       loadedReferences.forEach((ref, index) => {
         ref.signedReference = canonReferences[index];
