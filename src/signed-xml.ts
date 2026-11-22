@@ -29,9 +29,33 @@ import * as utils from "./utils";
 
 type SigningReferenceTarget = { node: Element; digestValue?: string };
 type UnsignedSignature = { doc: Document; insertSignatureValue: () => void };
+type VerificationKey = crypto.KeyLike | Promise<crypto.KeyLike>;
+type VerificationKeySource = "keyInfo" | "publicCert" | "privateKey";
+type VerificationSnapshot = {
+  generation: number;
+  signatureNode: Node | null;
+  signatureContent: string;
+  signatureValue: string;
+  keyInfo: Node | null;
+  keyInfoContent: string;
+  keyInfoCertificates: readonly string[];
+  canonicalizationAlgorithm?: CanonicalizationAlgorithmType;
+  signatureAlgorithm?: SignatureAlgorithmType;
+  publicCert?: crypto.KeyLike;
+  privateKey?: crypto.KeyLike;
+  publicCertIdentity: string;
+  privateKeyIdentity: string;
+  getCertFromKeyInfo: (keyInfo?: Node | null) => string | null;
+  keySource?: VerificationKeySource;
+  verificationKeyIdentity?: string;
+};
 type C14nOptionsWithXmlAttributes = CanonicalizationOrTransformationAlgorithmProcessOptions & {
   ancestorXmlAttributes?: utils.InheritedXmlAttribute[];
 };
+
+// Capture the built-in resolver by value: a patched or bound resolver must receive the live
+// KeyInfo, while the original may use the candidates frozen when the signature was loaded.
+const builtInResolvers: { getCertFromKeyInfo?: (keyInfo?: Node | null) => string | null } = {};
 
 function findSignatureElements(node: Node): Element[] {
   const signatures = xpath.select(
@@ -63,6 +87,52 @@ function isExclusiveC14n(algorithm: string | undefined): boolean {
 
 function decodeSignatureValue(signature: Node): Buffer {
   return Buffer.from(findSignatureValue(signature) ?? "", "base64");
+}
+
+function keyMaterialIdentity(key: crypto.KeyLike | undefined): string {
+  if (key == null) {
+    return "";
+  }
+  if (typeof key === "string") {
+    return `string:${key}`;
+  }
+  if (Buffer.isBuffer(key)) {
+    return `buffer:${key.toString("base64")}`;
+  }
+
+  try {
+    const der = key.export({ type: "spki", format: "der" });
+    return `key:${Buffer.isBuffer(der) ? der.toString("base64") : der}`;
+  } catch {
+    try {
+      return `jwk:${JSON.stringify(key.export({ format: "jwk" }))}`;
+    } catch {
+      return "key:unknown";
+    }
+  }
+}
+
+function certificateTextsFromKeyInfo(keyInfo: Node | null): string[] {
+  if (keyInfo == null) {
+    return [];
+  }
+
+  const certificates = xpath.select(".//*[local-name(.)='X509Certificate']", keyInfo);
+  if (!isDomNode.isArrayOfNodes(certificates)) {
+    return [];
+  }
+
+  return certificates
+    .filter(isDomNode.isElementNode)
+    .map((certificate) => certificate.textContent ?? "");
+}
+
+function isPromiseLike<T>(value: unknown): value is PromiseLike<T> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { then?: unknown }).then === "function"
+  );
 }
 
 const warnReferenceUriWithoutFragment = deprecate(
@@ -173,6 +243,14 @@ export class SignedXml {
   private signatureValue = "";
   private originalXmlWithIds = "";
   private keyInfo: Node | null = null;
+  private keyInfoContent = "";
+  private keyInfoCertificates: readonly string[] = [];
+  private loadedSignatureContent = "";
+
+  // A verification snapshot belongs to one generation. Loading a signature or starting another
+  // check supersedes it, and a late answer may neither publish state nor report success for an
+  // identity the instance no longer holds.
+  private validationGeneration = 0;
 
   /**
    * Contains the references that were signed.
@@ -351,7 +429,8 @@ export class SignedXml {
    *
    * @param xml The XML document containing the signature to be validated.
    * @returns `true` if the signature is valid
-   * @throws Error if no key info resolver is provided.
+   * @throws Error if no key info resolver is provided, or if the loaded signature, algorithm, or
+   *   verification key changes before the check completes.
    */
   checkSignature(xml: string): boolean;
   /**
@@ -380,11 +459,19 @@ export class SignedXml {
     if (!pending) {
       return pending;
     }
-    const { signer, key, unverifiedSignedInfoCanon, accept } = pending;
+    const { signer, key, signatureValue, snapshot, unverifiedSignedInfoCanon, accept } = pending;
+    if (isPromiseLike<crypto.KeyLike>(key)) {
+      throw new Error(
+        "getCertFromKeyInfo returned a promise; use checkSignatureAsync() to await it",
+      );
+    }
 
     if (!callback) {
-      if (signer.verifySignature(unverifiedSignedInfoCanon, key, this.signatureValue) !== true) {
-        throw this.invalidSignature();
+      if (signer.verifySignature(unverifiedSignedInfoCanon, key, signatureValue) !== true) {
+        throw this.invalidSignature(signatureValue);
+      }
+      if (!this.isVerificationCurrent(snapshot)) {
+        throw this.supersededSignature(signatureValue);
       }
       accept();
       return true;
@@ -399,7 +486,9 @@ export class SignedXml {
       if (error) {
         callback(error);
       } else if (isValid !== true) {
-        callback(this.invalidSignature());
+        callback(this.invalidSignature(signatureValue));
+      } else if (!this.isVerificationCurrent(snapshot)) {
+        callback(this.supersededSignature(signatureValue));
       } else {
         accept();
         callback(null, true);
@@ -409,7 +498,7 @@ export class SignedXml {
     const returned: unknown = signer.verifySignature(
       unverifiedSignedInfoCanon,
       key,
-      this.signatureValue,
+      signatureValue,
       answer,
     );
     // An algorithm that verifies synchronously can ignore the callback and return its verdict.
@@ -427,29 +516,50 @@ export class SignedXml {
    * @returns a promise for `true` if the signature is valid, and for `false` if a reference does
    *   not validate
    * @throws Error rejects with it if the signature value is incorrect, or if no key info resolver
-   *   is provided.
+   *   is provided, or if the loaded signature, algorithm, or verification key changes before the
+   *   check completes.
    */
   async checkSignatureAsync(xml: string): Promise<boolean> {
     const pending = this.validateReferences(xml);
     if (!pending) {
       return false;
     }
-    const { signer, key, unverifiedSignedInfoCanon, accept } = pending;
+    const {
+      signer,
+      key: unresolvedKey,
+      signatureValue,
+      snapshot,
+      unverifiedSignedInfoCanon,
+      accept,
+    } = pending;
+    const key = isPromiseLike<crypto.KeyLike>(unresolvedKey) ? await unresolvedKey : unresolvedKey;
+    if (!this.isVerificationCurrent(snapshot)) {
+      throw this.supersededSignature(signatureValue);
+    }
 
     const isValid =
       typeof signer.verifySignatureAsync === "function"
-        ? await signer.verifySignatureAsync(unverifiedSignedInfoCanon, key, this.signatureValue)
-        : signer.verifySignature(unverifiedSignedInfoCanon, key, this.signatureValue);
+        ? await signer.verifySignatureAsync(unverifiedSignedInfoCanon, key, signatureValue)
+        : signer.verifySignature(unverifiedSignedInfoCanon, key, signatureValue);
     if (isValid !== true) {
-      throw this.invalidSignature();
+      throw this.invalidSignature(signatureValue);
+    }
+    if (!this.isVerificationCurrent(snapshot)) {
+      throw this.supersededSignature(signatureValue);
     }
     accept();
     return true;
   }
 
-  private invalidSignature(): Error {
+  private invalidSignature(signatureValue = this.signatureValue): Error {
     // TODO: add this breaking change here later on for even more security: `this.references = [];`
-    return new Error(`invalid signature: the signature value ${this.signatureValue} is incorrect`);
+    return new Error(`invalid signature: the signature value ${signatureValue} is incorrect`);
+  }
+
+  private supersededSignature(signatureValue = this.signatureValue): Error {
+    return new Error(
+      `invalid signature: the signature value ${signatureValue} is no longer current because the KeyInfo, algorithm, or verification key changed before verification completed`,
+    );
   }
 
   // Core validation up to the signature over `SignedInfo`, which is left to the caller because the
@@ -459,6 +569,9 @@ export class SignedXml {
     xml: string,
     callback?: (error: Error | null, isValid?: boolean) => void,
   ) {
+    const generation = ++this.validationGeneration;
+    const snapshot = this.captureVerificationSnapshot(generation);
+
     // Nothing this check has not authenticated may be visible, even if it throws partway. Success
     // adds to what earlier successful checks on this instance published.
     const earlierSignedReferences = this.signedReferences;
@@ -474,7 +587,11 @@ export class SignedXml {
     // Reset the references as only references from our re-parsed signedInfo node can be trusted
     this.references = [];
 
-    const unverifiedSignedInfoCanon = this.getCanonSignedInfoXml(doc);
+    const unverifiedSignedInfoCanon = this.getCanonSignedInfoXml(
+      doc,
+      snapshot.signatureNode,
+      snapshot.canonicalizationAlgorithm,
+    );
     if (!unverifiedSignedInfoCanon) {
       if (callback) {
         callback(new Error("Canonical signed info cannot be empty"), false);
@@ -519,7 +636,7 @@ export class SignedXml {
 
     const canonReferences: string[] = [];
     for (const ref of this.references) {
-      const canonXml = this.validateReference(ref, doc);
+      const canonXml = this.validateReference(ref, doc, snapshot.signatureNode);
       if (canonXml === undefined) {
         // TODO: add this breaking change here later on for even more security: `this.references = [];`
 
@@ -540,33 +657,193 @@ export class SignedXml {
 
     // First find the key & signature algorithm, these should match
     // Stage B: Take the signature algorithm and key and verify the `SignatureValue` against the canonicalized `SignedInfo`
-    const signer = this.findSignatureAlgorithm(this.signatureAlgorithm);
-    const key = this.getCertFromKeyInfo(this.keyInfo) || this.publicCert || this.privateKey;
-    if (key == null) {
-      throw new Error("KeyInfo or publicCert or privateKey is required to validate signature");
-    }
+    const signer = this.findSignatureAlgorithm(snapshot.signatureAlgorithm);
+    const key = this.resolveVerificationKey(snapshot);
 
     // An asynchronous algorithm may answer after another check has replaced `this.references`.
     const loadedReferences = this.references;
     const accept = () => {
+      if (snapshot.generation !== this.validationGeneration || !this.isSnapshotCurrent(snapshot)) {
+        return;
+      }
       this.signedReferences = [...earlierSignedReferences, ...canonReferences];
       loadedReferences.forEach((ref, index) => {
         ref.signedReference = canonReferences[index];
       });
     };
 
-    return { signer, key, unverifiedSignedInfoCanon, accept };
+    return {
+      signer,
+      key,
+      signatureValue: snapshot.signatureValue,
+      snapshot,
+      unverifiedSignedInfoCanon,
+      accept,
+    };
   }
 
-  private getCanonSignedInfoXml(doc: Document) {
-    if (this.signatureNode == null) {
+  private captureVerificationSnapshot(generation: number): VerificationSnapshot {
+    const publicCert = this.publicCert;
+    const privateKey = this.privateKey;
+    return {
+      generation,
+      signatureNode: this.signatureNode,
+      signatureContent: this.loadedSignatureContent,
+      signatureValue: this.signatureValue,
+      keyInfo: this.keyInfo,
+      keyInfoContent: this.keyInfoContent,
+      keyInfoCertificates: [...this.keyInfoCertificates],
+      canonicalizationAlgorithm: this.canonicalizationAlgorithm,
+      signatureAlgorithm: this.signatureAlgorithm,
+      publicCert,
+      privateKey,
+      publicCertIdentity: keyMaterialIdentity(publicCert),
+      privateKeyIdentity: keyMaterialIdentity(privateKey),
+      getCertFromKeyInfo: this.getCertFromKeyInfo,
+    };
+  }
+
+  private isSnapshotCurrent(snapshot: VerificationSnapshot): boolean {
+    return (
+      snapshot.signatureContent === this.loadedSignatureContent &&
+      snapshot.signatureContent === (this.signatureNode?.toString() ?? "") &&
+      snapshot.signatureValue === this.signatureValue &&
+      snapshot.keyInfoContent === this.keyInfoContent &&
+      snapshot.keyInfoContent === (this.keyInfo?.toString() ?? "") &&
+      snapshot.canonicalizationAlgorithm === this.canonicalizationAlgorithm &&
+      snapshot.signatureAlgorithm === this.signatureAlgorithm &&
+      snapshot.publicCertIdentity === keyMaterialIdentity(this.publicCert) &&
+      snapshot.privateKeyIdentity === keyMaterialIdentity(this.privateKey) &&
+      snapshot.getCertFromKeyInfo === this.getCertFromKeyInfo
+    );
+  }
+
+  private resolveVerificationKey(snapshot: VerificationSnapshot): VerificationKey {
+    // The built-in resolver reads only certificate descendants, so use the candidates frozen at
+    // load time rather than a DOM the caller may have mutated since.
+    const certificate = (
+      snapshot.getCertFromKeyInfo === builtInResolvers.getCertFromKeyInfo
+        ? snapshot.keyInfoCertificates[0] == null
+          ? null
+          : utils.toPem(snapshot.keyInfoCertificates[0], "CERTIFICATE")
+        : snapshot.getCertFromKeyInfo.call(this, snapshot.keyInfo)
+    ) as string | null | Promise<string | null>;
+    if (isPromiseLike<string | null>(certificate)) {
+      return Promise.resolve(certificate).then((resolvedCertificate) => {
+        if (resolvedCertificate) {
+          snapshot.keySource = "keyInfo";
+          snapshot.verificationKeyIdentity = keyMaterialIdentity(
+            resolvedCertificate as crypto.KeyLike,
+          );
+          return resolvedCertificate as crypto.KeyLike;
+        }
+        return this.fallbackVerificationKey(snapshot);
+      });
+    }
+    if (certificate) {
+      snapshot.keySource = "keyInfo";
+      snapshot.verificationKeyIdentity = keyMaterialIdentity(certificate as crypto.KeyLike);
+      return certificate as crypto.KeyLike;
+    }
+    return this.fallbackVerificationKey(snapshot);
+  }
+
+  private fallbackVerificationKey(snapshot: VerificationSnapshot): crypto.KeyLike {
+    const publicCert = snapshot.publicCert;
+    if (publicCert) {
+      snapshot.keySource = "publicCert";
+      snapshot.verificationKeyIdentity = snapshot.publicCertIdentity;
+      return publicCert;
+    }
+    const privateKey = snapshot.privateKey;
+    if (privateKey) {
+      snapshot.keySource = "privateKey";
+      snapshot.verificationKeyIdentity = snapshot.privateKeyIdentity;
+      return privateKey;
+    }
+    throw new Error("KeyInfo or publicCert or privateKey is required to validate signature");
+  }
+
+  private isVerificationCurrent(snapshot: VerificationSnapshot): boolean {
+    if (snapshot.generation === this.validationGeneration) {
+      return this.isSnapshotCurrent(snapshot);
+    }
+    // A superseded check may still answer for itself only while a fresh check would resolve the
+    // same key source and certificate. Publishing remains bound to the newer generation.
+    return this.isVerificationKeyCurrent(snapshot);
+  }
+
+  private isVerificationKeyCurrent(snapshot: VerificationSnapshot): boolean {
+    if (
+      snapshot.canonicalizationAlgorithm !== this.canonicalizationAlgorithm ||
+      snapshot.signatureAlgorithm !== this.signatureAlgorithm ||
+      snapshot.getCertFromKeyInfo !== this.getCertFromKeyInfo ||
+      snapshot.keySource == null ||
+      snapshot.verificationKeyIdentity == null
+    ) {
+      return false;
+    }
+
+    const isBuiltInResolver = snapshot.getCertFromKeyInfo === builtInResolvers.getCertFromKeyInfo;
+    const keyInfoContent = this.keyInfo?.toString() ?? "";
+    if (
+      !isBuiltInResolver &&
+      (snapshot.keyInfoContent !== this.keyInfoContent ||
+        snapshot.keyInfoContent !== keyInfoContent)
+    ) {
+      return false;
+    }
+
+    switch (snapshot.keySource) {
+      case "keyInfo": {
+        if (isBuiltInResolver) {
+          const certificate = this.keyInfoCertificates[0];
+          if (certificate == null) {
+            return false;
+          }
+          try {
+            return (
+              keyMaterialIdentity(utils.toPem(certificate, "CERTIFICATE")) ===
+              snapshot.verificationKeyIdentity
+            );
+          } catch {
+            return false;
+          }
+        }
+        return true;
+      }
+      case "publicCert":
+        return (
+          (!isBuiltInResolver || this.keyInfoCertificates.length === 0) &&
+          !!this.publicCert &&
+          snapshot.publicCertIdentity === keyMaterialIdentity(this.publicCert)
+        );
+      case "privateKey":
+        return (
+          (!isBuiltInResolver ||
+            (this.keyInfoCertificates.length === 0 && !this.publicCert)) &&
+          !this.publicCert &&
+          snapshot.privateKeyIdentity === keyMaterialIdentity(this.privateKey)
+        );
+      default:
+        return false;
+    }
+  }
+
+  private getCanonSignedInfoXml(
+    doc: Document,
+    signatureNode: Node | null = this.signatureNode,
+    canonicalizationAlgorithm: CanonicalizationAlgorithmType | undefined =
+      this.canonicalizationAlgorithm,
+  ) {
+    if (signatureNode == null) {
       throw new Error("No signature found.");
     }
-    if (typeof this.canonicalizationAlgorithm !== "string") {
+    if (typeof canonicalizationAlgorithm !== "string") {
       throw new Error("Missing canonicalizationAlgorithm when trying to get signed info for XML");
     }
 
-    const signedInfo = utils.findChildren(this.signatureNode, "SignedInfo");
+    const signedInfo = utils.findChildren(signatureNode, "SignedInfo");
     if (signedInfo.length === 0) {
       throw new Error("could not find SignedInfo element in the message");
     }
@@ -577,8 +854,8 @@ export class SignedXml {
     }
 
     if (
-      this.canonicalizationAlgorithm === "http://www.w3.org/TR/2001/REC-xml-c14n-20010315" ||
-      this.canonicalizationAlgorithm ===
+      canonicalizationAlgorithm === "http://www.w3.org/TR/2001/REC-xml-c14n-20010315" ||
+      canonicalizationAlgorithm ===
         "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments"
     ) {
       if (!doc || typeof doc !== "object") {
@@ -588,17 +865,20 @@ export class SignedXml {
       }
     }
 
-    const c14nOptions = this.findSignedInfoAncestorContext(doc);
+    const c14nOptions = this.findSignedInfoAncestorContext(doc, signatureNode);
 
-    return this.getCanonXml([this.canonicalizationAlgorithm], signedInfo[0], c14nOptions);
+    return this.getCanonXml([canonicalizationAlgorithm], signedInfo[0], c14nOptions);
   }
 
   // The checked document gives SignedInfo its inherited context, not wherever a loaded copy
   // came from: https://www.w3.org/TR/xml-c14n#ProcessingModel
-  private findSignedInfoAncestorContext(doc: Document): C14nOptionsWithXmlAttributes {
-    const signatureInDoc = this.findLoadedSignature(doc);
+  private findSignedInfoAncestorContext(
+    doc: Document,
+    signatureNode: Node | null = this.signatureNode,
+  ): C14nOptionsWithXmlAttributes {
+    const signatureInDoc = this.findLoadedSignature(doc, signatureNode);
     if (signatureInDoc == null) {
-      return { ancestorNamespaces: [], ancestorXmlAttributes: [] };
+      return { ancestorNamespaces: [], ancestorXmlAttributes: [], signatureNode };
     }
 
     const signedInfoInDoc = utils.findChildren(signatureInDoc, "SignedInfo")[0];
@@ -608,10 +888,16 @@ export class SignedXml {
     return {
       ancestorNamespaces: utils.findAncestorNsForElement(signedInfoInDoc),
       ancestorXmlAttributes: utils.findAncestorXmlAttributes(signedInfoInDoc),
+      signatureNode,
     };
   }
 
-  private getCanonReferenceXml(doc: Document, ref: Reference, node: Node) {
+  private getCanonReferenceXml(
+    doc: Document,
+    ref: Reference,
+    node: Node,
+    signatureNode: Node | null = this.signatureNode,
+  ) {
     /**
      * Search for ancestor namespaces before canonicalization.
      */
@@ -622,6 +908,7 @@ export class SignedXml {
     const c14nOptions = {
       ancestorNamespaces: ref.ancestorNamespaces,
       ancestorXmlAttributes: utils.findAncestorXmlAttributes(node),
+      signatureNode,
     };
 
     // Only a same-document URI dereferences without comments; validateReference resolves no
@@ -748,7 +1035,11 @@ export class SignedXml {
     throw new Error("No references passed validation");
   }
 
-  private validateReference(ref: Reference, doc: Document): string | undefined {
+  private validateReference(
+    ref: Reference,
+    doc: Document,
+    signatureNode: Node | null = this.signatureNode,
+  ): string | undefined {
     const uri = ref.uri?.[0] === "#" ? ref.uri.substring(1) : ref.uri;
     let elem: xpath.SelectSingleReturnType = null;
 
@@ -802,7 +1093,7 @@ export class SignedXml {
       return undefined;
     }
 
-    const canonXml = this.getCanonReferenceXml(doc, ref, elem);
+    const canonXml = this.getCanonReferenceXml(doc, ref, elem, signatureNode);
     const hash = this.findHashAlgorithm(ref.digestAlgorithm);
     const digest = hash.getHash(canonXml);
 
@@ -827,88 +1118,124 @@ export class SignedXml {
     return isDomNode.isArrayOfNodes(nodes) ? nodes : [];
   }
 
+  private clearLoadedSignature(): void {
+    this.signatureNode = null;
+    this.signatureXml = "";
+    this.signatureValue = "";
+    this.keyInfo = null;
+    this.keyInfoContent = "";
+    this.keyInfoCertificates = [];
+    this.loadedSignatureContent = "";
+    this.references = [];
+    this.signedReferences = [];
+  }
+
   /**
    * Loads the signature information from the provided XML node or string.
    *
    * @param signatureNode The XML node or string representing the signature.
    */
   loadSignature(signatureNode: Node | string): void {
-    if (typeof signatureNode === "string") {
-      this.signatureNode = signatureNode = new xmldom.DOMParser().parseFromString(signatureNode);
-    } else {
-      this.signatureNode = signatureNode;
+    const previousCanonicalizationAlgorithm = this.canonicalizationAlgorithm;
+    const previousSignatureAlgorithm = this.signatureAlgorithm;
+    this.validationGeneration += 1;
+    this.clearLoadedSignature();
+
+    try {
+      const parsedSignature =
+        typeof signatureNode === "string"
+          ? new xmldom.DOMParser().parseFromString(signatureNode)
+          : signatureNode;
+      const signatureXml = parsedSignature.toString();
+      this.signatureNode = parsedSignature;
+      this.signatureXml = signatureXml;
+
+      const canonicalizationAlgorithmNode = xpath.select1(
+        ".//*[local-name(.)='CanonicalizationMethod']/@Algorithm",
+        parsedSignature,
+      );
+      if (!isDomNode.isNodeLike(canonicalizationAlgorithmNode)) {
+        throw new Error("could not find CanonicalizationMethod/@Algorithm element");
+      }
+
+      const canonicalizationAlgorithm = isDomNode.isAttributeNode(canonicalizationAlgorithmNode)
+        ? (canonicalizationAlgorithmNode.value as CanonicalizationAlgorithmType)
+        : previousCanonicalizationAlgorithm;
+
+      const signatureAlgorithmNode = xpath.select1(
+        ".//*[local-name(.)='SignatureMethod']/@Algorithm",
+        parsedSignature,
+      );
+      const signatureAlgorithm = isDomNode.isAttributeNode(signatureAlgorithmNode)
+        ? (signatureAlgorithmNode.value as SignatureAlgorithmType)
+        : previousSignatureAlgorithm;
+
+      const signedInfoNodes = utils.findChildren(parsedSignature, "SignedInfo");
+      if (!utils.isArrayHasLength(signedInfoNodes)) {
+        throw new Error("no signed info node found");
+      }
+      if (signedInfoNodes.length > 1) {
+        throw new Error("could not load signature that contains multiple SignedInfo nodes");
+      }
+
+      // Try to operate on the c14n version of `signedInfo`. This forces the initial `getReferences()`
+      // API call to always return references that are loaded under the canonical `SignedInfo`
+      // in the case that the client access the `.references` **before** signature verification.
+
+      // Ensure canonicalization algorithm is exclusive, otherwise we'd need the entire document
+      let canonicalizationAlgorithmForSignedInfo = canonicalizationAlgorithm;
+      if (
+        !canonicalizationAlgorithmForSignedInfo ||
+        canonicalizationAlgorithmForSignedInfo ===
+          "http://www.w3.org/TR/2001/REC-xml-c14n-20010315" ||
+        canonicalizationAlgorithmForSignedInfo ===
+          "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments"
+      ) {
+        canonicalizationAlgorithmForSignedInfo = "http://www.w3.org/2001/10/xml-exc-c14n#";
+      }
+
+      const temporaryCanonSignedInfo = this.getCanonXml(
+        [canonicalizationAlgorithmForSignedInfo],
+        signedInfoNodes[0],
+        { signatureNode: parsedSignature },
+      );
+      const temporaryCanonSignedInfoXml = new xmldom.DOMParser().parseFromString(
+        temporaryCanonSignedInfo,
+        "text/xml",
+      );
+      const signedInfoDoc = temporaryCanonSignedInfoXml.documentElement;
+
+      this.references = [];
+      const references = utils.findChildren(signedInfoDoc, "Reference");
+
+      if (!utils.isArrayHasLength(references)) {
+        throw new Error("could not find any Reference elements");
+      }
+
+      for (const reference of references) {
+        this.loadReference(reference);
+      }
+
+      const loadedReferences = this.references;
+      const keyInfo = utils.findChildren(parsedSignature, "KeyInfo")[0] ?? null;
+
+      this.signatureNode = parsedSignature;
+      this.signatureXml = signatureXml;
+      this.canonicalizationAlgorithm = canonicalizationAlgorithm;
+      this.signatureAlgorithm = signatureAlgorithm;
+      this.references = loadedReferences;
+      this.signatureValue = findSignatureValue(parsedSignature) ?? "";
+      this.keyInfo = keyInfo;
+      this.keyInfoContent = keyInfo?.toString() ?? "";
+      this.keyInfoCertificates = certificateTextsFromKeyInfo(keyInfo);
+      this.loadedSignatureContent = signatureXml;
+    } catch (error) {
+      // A failed load must not leave the previous signature's KeyInfo usable for another try.
+      this.clearLoadedSignature();
+      this.canonicalizationAlgorithm = previousCanonicalizationAlgorithm;
+      this.signatureAlgorithm = previousSignatureAlgorithm;
+      throw error;
     }
-
-    this.signatureXml = signatureNode.toString();
-
-    const node = xpath.select1(
-      ".//*[local-name(.)='CanonicalizationMethod']/@Algorithm",
-      signatureNode,
-    );
-    if (!isDomNode.isNodeLike(node)) {
-      throw new Error("could not find CanonicalizationMethod/@Algorithm element");
-    }
-
-    if (isDomNode.isAttributeNode(node)) {
-      this.canonicalizationAlgorithm = node.value as CanonicalizationAlgorithmType;
-    }
-
-    const signatureAlgorithm = xpath.select1(
-      ".//*[local-name(.)='SignatureMethod']/@Algorithm",
-      signatureNode,
-    );
-
-    if (isDomNode.isAttributeNode(signatureAlgorithm)) {
-      this.signatureAlgorithm = signatureAlgorithm.value as SignatureAlgorithmType;
-    }
-
-    const signedInfoNodes = utils.findChildren(this.signatureNode, "SignedInfo");
-    if (!utils.isArrayHasLength(signedInfoNodes)) {
-      throw new Error("no signed info node found");
-    }
-    if (signedInfoNodes.length > 1) {
-      throw new Error("could not load signature that contains multiple SignedInfo nodes");
-    }
-
-    // Try to operate on the c14n version of `signedInfo`. This forces the initial `getReferences()`
-    // API call to always return references that are loaded under the canonical `SignedInfo`
-    // in the case that the client access the `.references` **before** signature verification.
-
-    // Ensure canonicalization algorithm is exclusive, otherwise we'd need the entire document
-    let canonicalizationAlgorithmForSignedInfo = this.canonicalizationAlgorithm;
-    if (
-      !canonicalizationAlgorithmForSignedInfo ||
-      canonicalizationAlgorithmForSignedInfo ===
-        "http://www.w3.org/TR/2001/REC-xml-c14n-20010315" ||
-      canonicalizationAlgorithmForSignedInfo ===
-        "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments"
-    ) {
-      canonicalizationAlgorithmForSignedInfo = "http://www.w3.org/2001/10/xml-exc-c14n#";
-    }
-
-    const temporaryCanonSignedInfo = this.getCanonXml(
-      [canonicalizationAlgorithmForSignedInfo],
-      signedInfoNodes[0],
-    );
-    const temporaryCanonSignedInfoXml = new xmldom.DOMParser().parseFromString(
-      temporaryCanonSignedInfo,
-      "text/xml",
-    );
-    const signedInfoDoc = temporaryCanonSignedInfoXml.documentElement;
-
-    this.references = [];
-    const references = utils.findChildren(signedInfoDoc, "Reference");
-
-    if (!utils.isArrayHasLength(references)) {
-      throw new Error("could not find any Reference elements");
-    }
-
-    for (const reference of references) {
-      this.loadReference(reference);
-    }
-
-    this.signatureValue = findSignatureValue(signatureNode) ?? "";
-    this.keyInfo = utils.findChildren(signatureNode, "KeyInfo")[0] ?? null;
   }
 
   /**
@@ -1205,6 +1532,8 @@ export class SignedXml {
     options: ComputeSignatureOptions,
     callback?: ErrorFirstCallback<SignedXml>,
   ) {
+    this.validationGeneration += 1;
+
     const doc = new xmldom.DOMParser().parseFromString(xml);
     if (doc.doctype != null) {
       warnDocumentTypeDeclaration();
@@ -1364,6 +1693,7 @@ export class SignedXml {
     const insertSignatureValue = () => {
       signatureElem.insertBefore(this.createSignature(prefix), signedInfoNode.nextSibling);
       this.signatureXml = this.serialize(signatureElem);
+      this.loadedSignatureContent = signatureElem.toString();
       this.signedXml = this.serialize(doc);
     };
 
@@ -1626,13 +1956,16 @@ export class SignedXml {
     options.defaultNsForPrefix = options.defaultNsForPrefix ?? SignedXml.defaultNsForPrefix;
     options.ancestorXmlAttributes =
       options.ancestorXmlAttributes ?? utils.findAncestorXmlAttributes(node);
-    options.signatureNode = this.signatureNode;
+    if (options.signatureNode === undefined) {
+      options.signatureNode = this.signatureNode;
+    }
+    const loadedSignature = options.signatureNode ?? null;
 
     const canonXml = node.cloneNode(true); // Deep clone
     const preserveDocument = isDomNode.isDocumentNode(node);
     if (transforms.includes("http://www.w3.org/2000/09/xmldsig#enveloped-signature")) {
       const signaturePath: number[] = [];
-      let signatureAncestor = this.findLoadedSignature(node);
+      let signatureAncestor = this.findLoadedSignature(node, loadedSignature);
       while (signatureAncestor?.parentNode && signatureAncestor !== node) {
         signaturePath.push(
           Array.from<Node>(signatureAncestor.parentNode.childNodes).indexOf(signatureAncestor),
@@ -1665,7 +1998,8 @@ export class SignedXml {
           ancestorNamespaces: [],
           ancestorXmlAttributes: [],
           defaultNs: "",
-          signatureNode: this.findLoadedSignature(transformedXml) ?? options.signatureNode,
+          signatureNode:
+            this.findLoadedSignature(transformedXml, loadedSignature) ?? loadedSignature,
         };
         parsedFromOctets = true;
       }
@@ -1699,13 +2033,16 @@ export class SignedXml {
   // checkSignature() parses its own copy of the document, and octets a transform returns are parsed
   // again, so the loaded signature is found by the SignatureValue bytes verification decodes. A copy
   // carrying the same value could stand in for it, so refuse to guess.
-  private findLoadedSignature(node: Node): Node | null {
+  private findLoadedSignature(
+    node: Node,
+    signatureNode: Node | null = this.signatureNode,
+  ): Node | null {
     const doc = node.ownerDocument ?? node;
-    if (this.signatureNode == null || this.signatureNode.ownerDocument === doc) {
-      return this.signatureNode;
+    if (signatureNode == null || signatureNode.ownerDocument === doc) {
+      return signatureNode;
     }
 
-    const signatureValue = decodeSignatureValue(this.signatureNode);
+    const signatureValue = decodeSignatureValue(signatureNode);
     if (signatureValue.length === 0) {
       return null;
     }
@@ -1875,3 +2212,5 @@ export class SignedXml {
     return this.signedXml;
   }
 }
+
+builtInResolvers.getCertFromKeyInfo = SignedXml.getCertFromKeyInfo;
