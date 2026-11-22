@@ -461,6 +461,7 @@ Create a new `SignedXml` for each signature you create or verify, including each
 
 - `computeSignature()` signs every reference the instance holds. `addReference()` adds one, so calling it for each signature on a reused instance adds one more `Reference` to every new signature. `checkSignature()` replaces them with the references of the signature it checks.
 - `getSignedReferences()` returns the references of each successful `checkSignature()` call since the last failed one, which empties it. On a reused instance, that can include content that earlier signatures cover.
+- A check publishes its references only while the instance is still on that check's document transaction: `loadSignature()` and each check start a new one. A verdict an asynchronous algorithm delivers after another load or check has started — a concurrent check, a retry, one the caller gave up on — publishes nothing, so `getSignedReferences()` never mixes two documents' authenticated content.
 
 ## Customizing Algorithms
 

@@ -190,6 +190,11 @@ export class SignedXml {
    */
   private signedReferences: string[] = [];
 
+  // Identity of the document transaction the verification state belongs to. `loadSignature()`
+  // and each check freeze a new one, so a verdict an asynchronous algorithm delivers after the
+  // instance moved on to another signature or document cannot publish its references there.
+  private documentTransaction = 0;
+
   /**
    *  To add a new transformation algorithm create a new class that implements the {@link TransformationAlgorithm} interface, and register it here. More info: {@link https://github.com/node-saml/xml-crypto#customizing-algorithms|Customizing Algorithms}
    */
@@ -380,11 +385,11 @@ export class SignedXml {
     if (!pending) {
       return pending;
     }
-    const { signer, key, unverifiedSignedInfoCanon, accept } = pending;
+    const { signer, key, unverifiedSignedInfoCanon, signatureValue, accept } = pending;
 
     if (!callback) {
-      if (signer.verifySignature(unverifiedSignedInfoCanon, key, this.signatureValue) !== true) {
-        throw this.invalidSignature();
+      if (signer.verifySignature(unverifiedSignedInfoCanon, key, signatureValue) !== true) {
+        throw this.invalidSignature(signatureValue);
       }
       accept();
       return true;
@@ -399,7 +404,7 @@ export class SignedXml {
       if (error) {
         callback(error);
       } else if (isValid !== true) {
-        callback(this.invalidSignature());
+        callback(this.invalidSignature(signatureValue));
       } else {
         accept();
         callback(null, true);
@@ -409,7 +414,7 @@ export class SignedXml {
     const returned: unknown = signer.verifySignature(
       unverifiedSignedInfoCanon,
       key,
-      this.signatureValue,
+      signatureValue,
       answer,
     );
     // An algorithm that verifies synchronously can ignore the callback and return its verdict.
@@ -434,22 +439,22 @@ export class SignedXml {
     if (!pending) {
       return false;
     }
-    const { signer, key, unverifiedSignedInfoCanon, accept } = pending;
+    const { signer, key, unverifiedSignedInfoCanon, signatureValue, accept } = pending;
 
     const isValid =
       typeof signer.verifySignatureAsync === "function"
-        ? await signer.verifySignatureAsync(unverifiedSignedInfoCanon, key, this.signatureValue)
-        : signer.verifySignature(unverifiedSignedInfoCanon, key, this.signatureValue);
+        ? await signer.verifySignatureAsync(unverifiedSignedInfoCanon, key, signatureValue)
+        : signer.verifySignature(unverifiedSignedInfoCanon, key, signatureValue);
     if (isValid !== true) {
-      throw this.invalidSignature();
+      throw this.invalidSignature(signatureValue);
     }
     accept();
     return true;
   }
 
-  private invalidSignature(): Error {
+  private invalidSignature(signatureValue: string): Error {
     // TODO: add this breaking change here later on for even more security: `this.references = [];`
-    return new Error(`invalid signature: the signature value ${this.signatureValue} is incorrect`);
+    return new Error(`invalid signature: the signature value ${signatureValue} is incorrect`);
   }
 
   // Core validation up to the signature over `SignedInfo`, which is left to the caller because the
@@ -459,8 +464,10 @@ export class SignedXml {
     xml: string,
     callback?: (error: Error | null, isValid?: boolean) => void,
   ) {
-    // Nothing this check has not authenticated may be visible, even if it throws partway. Success
-    // adds to what earlier successful checks on this instance published.
+    // Freeze a new document transaction for this check. Nothing it has not authenticated may be
+    // visible, even if it throws partway. Success adds to what earlier successful checks on this
+    // instance published; a transaction another load or check has superseded publishes nothing.
+    const transaction = ++this.documentTransaction;
     const earlierSignedReferences = this.signedReferences;
     this.signedReferences = [];
 
@@ -546,16 +553,22 @@ export class SignedXml {
       throw new Error("KeyInfo or publicCert or privateKey is required to validate signature");
     }
 
-    // An asynchronous algorithm may answer after another check has replaced `this.references`.
+    // An asynchronous algorithm may answer after another load or check has replaced
+    // `this.references` and frozen a new transaction, so what the answer verifies and what its
+    // acceptance publishes both belong to this transaction.
+    const signatureValue = this.signatureValue;
     const loadedReferences = this.references;
     const accept = () => {
+      if (transaction !== this.documentTransaction) {
+        return;
+      }
       this.signedReferences = [...earlierSignedReferences, ...canonReferences];
       loadedReferences.forEach((ref, index) => {
         ref.signedReference = canonReferences[index];
       });
     };
 
-    return { signer, key, unverifiedSignedInfoCanon, accept };
+    return { signer, key, unverifiedSignedInfoCanon, signatureValue, accept };
   }
 
   private getCanonSignedInfoXml(doc: Document) {
@@ -833,6 +846,11 @@ export class SignedXml {
    * @param signatureNode The XML node or string representing the signature.
    */
   loadSignature(signatureNode: Node | string): void {
+    // Loading a signature freezes the instance, the signature node, and their document
+    // transaction identity together: a check of the previously loaded signature whose verdict
+    // is still in flight can no longer publish into this transaction.
+    this.documentTransaction += 1;
+
     if (typeof signatureNode === "string") {
       this.signatureNode = signatureNode = new xmldom.DOMParser().parseFromString(signatureNode);
     } else {
