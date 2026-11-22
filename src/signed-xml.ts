@@ -33,6 +33,23 @@ type C14nOptionsWithXmlAttributes = CanonicalizationOrTransformationAlgorithmPro
   ancestorXmlAttributes?: utils.InheritedXmlAttribute[];
 };
 
+// A document type declaration can carry an internal subset that defines entities and default
+// attributes. The parser does not give them XML Signature semantics: an entity may stay
+// unexpanded or be expanded for only part of a document, and a default attribute is not added,
+// so what gets digested can differ from what a consumer reads. Refuse the declaration rather
+// than guess which semantics apply: https://www.w3.org/TR/xml-c14n#Terminology
+function parseDocument(xml: string): Document {
+  const doc = new xmldom.DOMParser().parseFromString(xml);
+  if (doc.doctype != null) {
+    throw new Error(
+      "Cannot sign or verify a document that has a document type declaration (`<!DOCTYPE>`). " +
+        "Remove the declaration, or strip its entities and default attributes before calling " +
+        "xml-crypto.",
+    );
+  }
+  return doc;
+}
+
 function findSignatureElements(node: Node): Element[] {
   const signatures = xpath.select(
     ".//*[local-name(.)='Signature' and namespace-uri(.)='http://www.w3.org/2000/09/xmldsig#']",
@@ -113,12 +130,6 @@ const warnOriginalXmlWithIds = deprecate(
   () => {},
   "`getOriginalXmlWithIds()` is deprecated and will be removed in a future version. Use the `location` option of `computeSignature()` to place the signature, then `getSignedXml()`. For a detached signature, put an ID attribute the signer recognizes on each referenced element (`wsu:Id` for WS-Security), sign that document, and send it alongside `getSignatureXml()`.",
   "XML_CRYPTO_GET_ORIGINAL_XML_WITH_IDS",
-);
-
-const warnDocumentTypeDeclaration = deprecate(
-  () => {},
-  "Signing or verifying a document that has a document type declaration (`<!DOCTYPE>`) is deprecated and will throw in version 7.0. The declaration is not processed, so an entity it declares is not expanded and a default attribute it declares is not added to what is signed or verified.",
-  "XML_CRYPTO_DOCUMENT_TYPE_DECLARATION",
 );
 
 const warnValidateElementAgainstReferences = deprecate(
@@ -463,13 +474,13 @@ export class SignedXml {
     // adds to what earlier successful checks on this instance published.
     const earlierSignedReferences = this.signedReferences;
     this.signedReferences = [];
+    this.references.forEach((reference) => {
+      delete reference.signedReference;
+    });
+
+    const doc = parseDocument(xml);
 
     this.signedXml = xml;
-
-    const doc = new xmldom.DOMParser().parseFromString(xml);
-    if (doc.doctype != null) {
-      warnDocumentTypeDeclaration();
-    }
 
     // Reset the references as only references from our re-parsed signedInfo node can be trusted
     this.references = [];
@@ -1205,10 +1216,7 @@ export class SignedXml {
     options: ComputeSignatureOptions,
     callback?: ErrorFirstCallback<SignedXml>,
   ) {
-    const doc = new xmldom.DOMParser().parseFromString(xml);
-    if (doc.doctype != null) {
-      warnDocumentTypeDeclaration();
-    }
+    const doc = parseDocument(xml);
     let xmlNsAttr = "xmlns";
     const signatureAttrs: string[] = [];
     let currentPrefix: string;

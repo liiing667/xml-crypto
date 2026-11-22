@@ -99,12 +99,15 @@ The `enveloped-signature` transform removes only the `Signature` element being v
 
 ### Documents with a DOCTYPE
 
-`computeSignature()` and `checkSignature()` do not process a document type declaration. An entity
-it declares is not expanded and a default attribute it declares is not added, though
-[Canonical XML](https://www.w3.org/TR/xml-c14n#Terminology) requires both, so the canonical form is
-not the one an implementation that processes the declaration computes. Signing or verifying a
-document that has a DOCTYPE is deprecated and will throw in 7.0. Until then it prints a
-`DeprecationWarning`.
+`computeSignature()` and `checkSignature()` throw on a document that has a document type
+declaration (`<!DOCTYPE>`). A declaration can define entities and default attributes, and the
+parser does not give them the semantics
+[Canonical XML](https://www.w3.org/TR/xml-c14n#Terminology) requires: an entity may stay
+unexpanded or be expanded for only part of the document, and a default attribute is not added, so
+the digested nodes can differ from the nodes a consumer reads.
+The error is raised before any reference is resolved, so a document that carries a declaration is
+neither signed nor reported as verified. Remove the declaration, or resolve its entities and
+attributes into ordinary markup, before calling the library.
 
 ### Malformed certificates
 
