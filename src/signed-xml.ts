@@ -28,7 +28,29 @@ import * as signatureAlgorithms from "./signature-algorithms";
 import * as utils from "./utils";
 
 type SigningReferenceTarget = { node: Element; digestValue?: string };
-type UnsignedSignature = { doc: Document; insertSignatureValue: () => void };
+type UnsignedSignature = {
+  doc: Document;
+  signatureNode: Element;
+  originalXmlWithIds: string;
+  signedInfoCanon: string;
+  signer: SignatureAlgorithm;
+  privateKey: crypto.KeyLike;
+  insertSignatureValue: (signatureValue: string) => {
+    signatureXml: string;
+    signedXml: string;
+  };
+};
+type ReferenceState = {
+  reference: Reference;
+  uri: string;
+  ancestorNamespaces?: Reference["ancestorNamespaces"];
+};
+type SigningAttemptState = {
+  id: number;
+  namespaceResolver: XPathNSResolver;
+  references: Reference[];
+  referenceStates: ReferenceState[];
+};
 type C14nOptionsWithXmlAttributes = CanonicalizationOrTransformationAlgorithmProcessOptions & {
   ancestorXmlAttributes?: utils.InheritedXmlAttribute[];
 };
@@ -167,6 +189,7 @@ export class SignedXml {
 
   // Internal state
   private id = 0;
+  private generation = 0;
   private signedXml = "";
   private signatureXml = "";
   private signatureNode: Node | null = null;
@@ -452,6 +475,15 @@ export class SignedXml {
     return new Error(`invalid signature: the signature value ${this.signatureValue} is incorrect`);
   }
 
+  private beginGeneration(): number {
+    this.generation += 1;
+    return this.generation;
+  }
+
+  private isCurrentGeneration(generation: number): boolean {
+    return this.generation === generation;
+  }
+
   // Core validation up to the signature over `SignedInfo`, which is left to the caller because the
   // signature algorithm may answer later. Returns `false`, or nothing once the callback has the
   // reason, when a reference does not validate.
@@ -459,6 +491,7 @@ export class SignedXml {
     xml: string,
     callback?: (error: Error | null, isValid?: boolean) => void,
   ) {
+    const generation = this.beginGeneration();
     // Nothing this check has not authenticated may be visible, even if it throws partway. Success
     // adds to what earlier successful checks on this instance published.
     const earlierSignedReferences = this.signedReferences;
@@ -546,13 +579,21 @@ export class SignedXml {
       throw new Error("KeyInfo or publicCert or privateKey is required to validate signature");
     }
 
-    // An asynchronous algorithm may answer after another check has replaced `this.references`.
+    // An asynchronous algorithm may answer after another operation has taken over this instance.
+    // Publishing is tied to the generation that loaded these references, so a late answer cannot
+    // replace the state of a document that is no longer under inspection.
     const loadedReferences = this.references;
+    let accepted = false;
     const accept = () => {
+      if (accepted || !this.isCurrentGeneration(generation)) {
+        return false;
+      }
+      accepted = true;
       this.signedReferences = [...earlierSignedReferences, ...canonReferences];
       loadedReferences.forEach((ref, index) => {
         ref.signedReference = canonReferences[index];
       });
+      return true;
     };
 
     return { signer, key, unverifiedSignedInfoCanon, accept };
@@ -643,27 +684,30 @@ export class SignedXml {
     );
   }
 
-  private signingInput(doc: Document) {
-    const signedInfoCanon = this.getCanonSignedInfoXml(doc);
-    const signer = this.findSignatureAlgorithm(this.signatureAlgorithm);
-    if (this.privateKey == null) {
-      throw new Error("Private key is required to compute signature");
-    }
-    return { signedInfoCanon, signer, privateKey: this.privateKey };
-  }
-
-  private calculateSignatureValue(doc: Document, callback?: ErrorFirstCallback<string>) {
-    const { signedInfoCanon, signer, privateKey } = this.signingInput(doc);
+  private calculateSignatureValue(
+    unsigned: UnsignedSignature,
+    callback?: ErrorFirstCallback<string>,
+  ): string | undefined {
+    const { signedInfoCanon, signer, privateKey } = unsigned;
     if (typeof callback === "function") {
+      let answered = false;
+      const answer = (error: Error | null, signature?: string) => {
+        if (answered) {
+          return;
+        }
+        answered = true;
+        callback(error, signature);
+      };
       /* eslint-disable-next-line deprecation/deprecation */
-      signer.getSignature(signedInfoCanon, privateKey, callback);
+      signer.getSignature(signedInfoCanon, privateKey, answer);
+      return;
     } else {
-      this.signatureValue = signer.getSignature(signedInfoCanon, privateKey);
+      return signer.getSignature(signedInfoCanon, privateKey);
     }
   }
 
-  private async calculateSignatureValueAsync(doc: Document) {
-    const { signedInfoCanon, signer, privateKey } = this.signingInput(doc);
+  private async calculateSignatureValueAsync(unsigned: UnsignedSignature): Promise<string> {
+    const { signedInfoCanon, signer, privateKey } = unsigned;
     const signatureValue: unknown =
       typeof signer.getSignatureAsync === "function"
         ? await signer.getSignatureAsync(signedInfoCanon, privateKey)
@@ -674,7 +718,7 @@ export class SignedXml {
         "the signature algorithm returned no signature; an algorithm that signs asynchronously implements getSignatureAsync()",
       );
     }
-    this.signatureValue = signatureValue;
+    return signatureValue;
   }
 
   private findSignatureAlgorithm(name?: SignatureAlgorithmType) {
@@ -833,6 +877,16 @@ export class SignedXml {
    * @param signatureNode The XML node or string representing the signature.
    */
   loadSignature(signatureNode: Node | string): void {
+    this.beginGeneration();
+    this.signedReferences = [];
+    this.signedXml = "";
+    this.signatureXml = "";
+    this.originalXmlWithIds = "";
+    this.signatureNode = null;
+    this.signatureValue = "";
+    this.keyInfo = null;
+    this.references = [];
+
     if (typeof signatureNode === "string") {
       this.signatureNode = signatureNode = new xmldom.DOMParser().parseFromString(signatureNode);
     } else {
@@ -896,7 +950,6 @@ export class SignedXml {
     );
     const signedInfoDoc = temporaryCanonSignedInfoXml.documentElement;
 
-    this.references = [];
     const references = utils.findChildren(signedInfoDoc, "Reference");
 
     if (!utils.isArrayHasLength(references)) {
@@ -1149,26 +1202,63 @@ export class SignedXml {
       warnCallbackForm();
     }
 
-    const unsigned = this.prepareSignature(xml, options, callback);
+    const { generation, state } = this.beginSigningAttempt();
+    let unsigned: UnsignedSignature | undefined;
+    try {
+      unsigned = this.prepareSignature(xml, options, callback);
+    } catch (error) {
+      this.restoreSigningAttempt(generation, state);
+      throw error;
+    }
     if (!unsigned) {
+      this.restoreSigningAttempt(generation, state);
       return;
     }
 
     if (typeof callback === "function") {
       // Asynchronous flow
-      this.calculateSignatureValue(unsigned.doc, (err, signature) => {
-        if (err) {
-          callback(err);
-        } else {
-          this.signatureValue = signature || "";
-          unsigned.insertSignatureValue();
+      let published = false;
+      try {
+        this.calculateSignatureValue(unsigned, (err, signature) => {
+          if (err) {
+            this.restoreSigningAttempt(generation, state);
+            callback(err);
+            return;
+          }
+          if (!this.isCurrentGeneration(generation)) {
+            callback(this.supersededAttemptError("signature computation"));
+            return;
+          }
+
+          try {
+            this.publishSignature(unsigned, signature ?? "");
+          } catch (error) {
+            this.restoreSigningAttempt(generation, state);
+            callback(error instanceof Error ? error : new Error("Unknown error"));
+            return;
+          }
+          published = true;
           callback(null, this);
+        });
+      } catch (error) {
+        if (!published) {
+          this.restoreSigningAttempt(generation, state);
         }
-      });
+        throw error;
+      }
     } else {
       // Synchronous flow
-      this.calculateSignatureValue(unsigned.doc);
-      unsigned.insertSignatureValue();
+      let signatureValue: string | undefined;
+      try {
+        signatureValue = this.calculateSignatureValue(unsigned);
+        if (typeof signatureValue !== "string") {
+          throw new Error("the signature algorithm returned no signature");
+        }
+        this.publishSignature(unsigned, signatureValue);
+      } catch (error) {
+        this.restoreSigningAttempt(generation, state);
+        throw error;
+      }
     }
   }
 
@@ -1187,10 +1277,71 @@ export class SignedXml {
     xml: string,
     options: ComputeSignatureOptions = {},
   ): Promise<SignedXml> {
-    const unsigned = this.prepareSignature(xml, options);
-    await this.calculateSignatureValueAsync(unsigned.doc);
-    unsigned.insertSignatureValue();
-    return this;
+    const { generation, state } = this.beginSigningAttempt();
+    let unsigned: UnsignedSignature;
+    try {
+      unsigned = this.prepareSignature(xml, options);
+      const signatureValue = await this.calculateSignatureValueAsync(unsigned);
+      if (!this.isCurrentGeneration(generation)) {
+        throw this.supersededAttemptError("signature computation");
+      }
+      this.publishSignature(unsigned, signatureValue);
+      return this;
+    } catch (error) {
+      this.restoreSigningAttempt(generation, state);
+      throw error;
+    }
+  }
+
+  private beginSigningAttempt(): { generation: number; state: SigningAttemptState } {
+    const generation = this.beginGeneration();
+    const state: SigningAttemptState = {
+      id: this.id,
+      namespaceResolver: this.namespaceResolver,
+      references: this.references,
+      referenceStates: this.references.map((reference) => ({
+        reference,
+        uri: reference.uri,
+        ancestorNamespaces: reference.ancestorNamespaces,
+      })),
+    };
+
+    this.id = 0;
+    this.signedXml = "";
+    this.signatureXml = "";
+    this.originalXmlWithIds = "";
+    this.signedReferences = [];
+    return { generation, state };
+  }
+
+  private restoreSigningAttempt(generation: number, state: SigningAttemptState): void {
+    if (!this.isCurrentGeneration(generation)) {
+      return;
+    }
+
+    this.id = state.id;
+    this.namespaceResolver = state.namespaceResolver;
+    if (this.references === state.references) {
+      for (const referenceState of state.referenceStates) {
+        referenceState.reference.uri = referenceState.uri;
+        referenceState.reference.ancestorNamespaces = referenceState.ancestorNamespaces;
+      }
+    }
+  }
+
+  private publishSignature(unsigned: UnsignedSignature, signatureValue: string): void {
+    const { signatureXml, signedXml } = unsigned.insertSignatureValue(signatureValue);
+    this.signatureNode = unsigned.signatureNode;
+    this.signatureValue = signatureValue;
+    this.signatureXml = signatureXml;
+    this.signedXml = signedXml;
+    this.originalXmlWithIds = unsigned.originalXmlWithIds;
+  }
+
+  private supersededAttemptError(operation: string): Error {
+    return new Error(
+      `the ${operation} was superseded by a later operation, so its result was not published`,
+    );
   }
 
   // Everything but the signature value. Returns nothing once the callback has the reason it stopped.
@@ -1258,7 +1409,7 @@ export class SignedXml {
     this.ensureTargetsHaveIds(referenceTargets);
 
     // Capture original with IDs (no sig yet)
-    this.originalXmlWithIds = this.serialize(doc);
+    const originalXmlWithIds = this.serialize(doc);
 
     // automatic insertion of `:`
     if (prefix) {
@@ -1344,30 +1495,48 @@ export class SignedXml {
       }
 
       this.addAllReferences(doc, signatureElem, referenceTargets, prefix);
-    } catch (error) {
-      this.signatureNode = previousSignatureNode;
-      throw error;
-    }
 
-    const signedInfoNodes = utils.findChildren(this.signatureNode, "SignedInfo");
-    if (signedInfoNodes.length === 0) {
-      const err3 = new Error("could not find SignedInfo element in the message");
-      if (!callback) {
-        throw err3;
-      } else {
-        callback(err3);
-        return;
+      const signedInfoNodes = utils.findChildren(signatureElem, "SignedInfo");
+      if (signedInfoNodes.length === 0) {
+        const err3 = new Error("could not find SignedInfo element in the message");
+        if (!callback) {
+          throw err3;
+        } else {
+          callback(err3);
+          return;
+        }
       }
+      const signedInfoNode = signedInfoNodes[0];
+
+      const insertSignatureValue = (signatureValue: string) => {
+        signatureElem.insertBefore(
+          this.createSignature(prefix, signatureValue),
+          signedInfoNode.nextSibling,
+        );
+        return {
+          signatureXml: this.serialize(signatureElem),
+          signedXml: this.serialize(doc),
+        };
+      };
+
+      const signedInfoCanon = this.getCanonSignedInfoXml(doc);
+      const signer = this.findSignatureAlgorithm(this.signatureAlgorithm);
+      if (this.privateKey == null) {
+        throw new Error("Private key is required to compute signature");
+      }
+
+      return {
+        doc,
+        signatureNode: signatureElem,
+        originalXmlWithIds,
+        signedInfoCanon,
+        signer,
+        privateKey: this.privateKey,
+        insertSignatureValue,
+      };
+    } finally {
+      this.signatureNode = previousSignatureNode;
     }
-    const signedInfoNode = signedInfoNodes[0];
-
-    const insertSignatureValue = () => {
-      signatureElem.insertBefore(this.createSignature(prefix), signedInfoNode.nextSibling);
-      this.signatureXml = this.serialize(signatureElem);
-      this.signedXml = this.serialize(doc);
-    };
-
-    return { doc, insertSignatureValue };
   }
 
   // The signer parses its input, so a carriage return reaches the DOM only through a character
@@ -1821,7 +1990,7 @@ export class SignedXml {
    * Create the Signature element
    *
    */
-  private createSignature(prefix?: string) {
+  private createSignature(prefix: string | undefined, signatureValue: string) {
     let xmlNsAttr = "xmlns";
 
     if (prefix) {
@@ -1831,7 +2000,7 @@ export class SignedXml {
       prefix = "";
     }
 
-    const signatureValueXml = `<${prefix}SignatureValue>${this.signatureValue}</${prefix}SignatureValue>`;
+    const signatureValueXml = `<${prefix}SignatureValue>${signatureValue}</${prefix}SignatureValue>`;
     //the canonicalization requires to get a valid xml node.
     //we need to wrap the info in a dummy signature since it contains the default namespace.
     const dummySignatureWrapper = `<${prefix}Signature ${xmlNsAttr}="http://www.w3.org/2000/09/xmldsig#">${signatureValueXml}</${prefix}Signature>`;
